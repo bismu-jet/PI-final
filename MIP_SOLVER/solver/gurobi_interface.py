@@ -16,7 +16,7 @@ def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, 
     Returns:
         Dict[str, Any]: A dictionary containing the status, objective value, and solution
                         of the LP relaxation. Format: {
-                             'status ': str,  # OPTIMAL, INFEASIBLE, UNBOUNDED, etc.
+                             'status': str,  # OPTIMAL, INFEASIBLE, UNBOUNDED, etc.
                              'objective ': float | None,
                              'solution ': Dict[str, float] | None
                         }
@@ -47,37 +47,37 @@ def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, 
     try:
         model.optimize()
 
-        if model.status == GRB.OPTIMAL:
+        if model.status== GRB.OPTIMAL:
             return {
-                 'status ':  'OPTIMAL ',
-                 'objective ': model.ObjVal,
-                 'solution ': {v.VarName: v.X for v in model.getVars()}
+                 'status':  'OPTIMAL',
+                 'objective': model.ObjVal,
+                 'solution': {v.VarName: v.X for v in model.getVars()}
             }
-        elif model.status == GRB.INFEASIBLE:
+        elif model.status== GRB.INFEASIBLE:
             return {
-                 'status ':  'INFEASIBLE ',
-                 'objective ': None,
-                 'solution ': None
+                 'status':  'INFEASIBLE',
+                 'objective': None,
+                 'solution': None
             }
-        elif model.status == GRB.UNBOUNDED:
+        elif model.status== GRB.UNBOUNDED:
             return {
-                 'status ':  'UNBOUNDED ',
-                 'objective ': None,
-                 'solution ': None
+                 'status':  'UNBOUNDED',
+                 'objective': None,
+                 'solution': None
             }
         else:
             # Handle other statuses gracefully, e.g., TIME_LIMIT, INF_OR_UNBD
             return {
-                 'status ': GRB.Status[model.status],
-                 'objective ': None,
-                 'solution ': None
+                 'status': GRB.Status[model.status],
+                 'objective': None,
+                 'solution': None
             }
     except gp.GurobiError as e:
         print(f"Gurobi Error: {e}")
         return {
-             'status ':  'ERROR ',
-             'objective ': None,
-             'solution ': None
+             'status':  'ERROR',
+             'objective': None,
+             'solution': None
         }
     finally:
         model.dispose() # Release Gurobi resources
