@@ -1,92 +1,53 @@
+# solver/gurobi_interface.py
+
 import gurobipy as gp
 from gurobipy import GRB
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Optional
 from solver.problem import MIPProblem
 
-def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, str, float]]) -> Dict[str, Any]:
+def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, str, float]], time_limit: Optional[float]) -> Dict:
     """
-    Solves the LP relaxation of a given MIP problem with additional local constraints.
-
-    Args:
-        problem (MIPProblem): The MIPProblem instance containing the base Gurobi model.
-        local_constraints (List[Tuple[str, str, float]]): A list of constraints to apply
-                                                        to the current LP relaxation.
-                                                        E.g., [( 'x1 ',  '<= ', 0), ( 'x2 ',  '>= ', 1)].
-
-    Returns:
-        Dict[str, Any]: A dictionary containing the status, objective value, and solution
-                        of the LP relaxation. Format: {
-                             'status': str,  # OPTIMAL, INFEASIBLE, UNBOUNDED, etc.
-                             'objective ': float | None,
-                             'solution ': Dict[str, float] | None
-                        }
+    Solves the LP relaxation. This version RELAXES INTEGER VARIABLES to
+    ensure Gurobi acts as a pure LP solver.
     """
-    # Create a copy of the base Gurobi model to avoid modifying the original
-    model = problem.model.copy()
-    model.setParam("OutputFlag", 0)  # Suppress Gurobi output
-
-    # Apply local constraints
-    for var_name, sense, rhs in local_constraints:
-        var = model.getVarByName(var_name)
-        if var is None:
-            raise ValueError(f"Variable {var_name} not found in model.")
-        if sense == ">=":
-            model.addConstr(var >= rhs, name=f"local_con_{var_name}_ge_{rhs}")
-        elif sense == "<=":
-            model.addConstr(var <= rhs, name=f"local_con_{var_name}_le_{rhs}")
-        elif sense == "==":
-            model.addConstr(var == rhs, name=f"local_con_{var_name}_eq_{rhs}")
-        else:
-            raise ValueError(f"Unsupported constraint sense: {sense}")
-
-    # Set Gurobi parameters to ensure it only solves the LP relaxation
-    model.setParam('Presolve', 0)
-    model.setParam('Cuts', 0)
-    model.setParam('Heuristics', 0)
-    
-    # --- ADD THIS LINE FOR DEBUGGING ---
-    model.setParam('LogToConsole', 1) 
-    # -----------------------------------
+    model_copy = None
     try:
-        # --- TEMPORARY DEBUGGING LOGS ---
-        print("DEBUG: About to call model.optimize(). This might take a while...")
-        # ------------------------------------
-        model.optimize()
-        # --- TEMPORARY DEBUGGING LOGS ---
-        print("DEBUG: model.optimize() has finished.")
-        # ------------------------------------
+        model_copy = problem.model.copy()
 
-        if model.status== GRB.OPTIMAL:
-            return {
-                 'status':  'OPTIMAL',
-                 'objective': model.ObjVal,
-                 'solution': {v.VarName: v.X for v in model.getVars()}
-            }
-        elif model.status== GRB.INFEASIBLE:
-            return {
-                 'status':  'INFEASIBLE',
-                 'objective': None,
-                 'solution': None
-            }
-        elif model.status== GRB.UNBOUNDED:
-            return {
-                 'status':  'UNBOUNDED',
-                 'objective': None,
-                 'solution': None
-            }
+        # --- THIS IS THE MOST IMPORTANT STEP IN THE ENTIRE FILE ---
+        # We iterate through all variables in our copied model.
+        # If a variable is an Integer or Binary, we change its type to Continuous.
+        # This prevents Gurobi's MIP solver from activating.
+        for var in model_copy.getVars():
+            if var.VType in [GRB.BINARY, GRB.INTEGER]:
+                var.VType = GRB.CONTINUOUS
+        # -----------------------------------------------------------------
+
+        for var_name, sense, bound in local_constraints:
+            var = model_copy.getVarByName(var_name)
+            if sense == '<=': model_copy.addConstr(var <= bound)
+            else: model_copy.addConstr(var >= bound)
+
+        model_copy.setParam('Presolve', 0)
+        model_copy.setParam('Cuts', 0)
+        model_copy.setParam('Heuristics', 0)
+        model_copy.setParam('LogToConsole', 0)
+
+        if time_limit is not None and time_limit > 0:
+            model_copy.setParam(GRB.Param.TimeLimit, time_limit)
+
+        model_copy.optimize()
+
+        # Process and return results... (rest of the function is the same)
+        if model_copy.status == GRB.Status.OPTIMAL:
+            return {'status': 'OPTIMAL', 'objective': model_copy.ObjVal, 'solution': {v.VarName: v.X for v in model_copy.getVars()}}
+        elif model_copy.status == GRB.Status.TIME_LIMIT:
+             return {'status': 'TIME_LIMIT', 'objective': model_copy.ObjVal if model_copy.SolCount > 0 else None, 'solution': {v.VarName: v.X for v in model_copy.getVars()} if model_copy.SolCount > 0 else None}
         else:
-            # Handle other statuses gracefully, e.g., TIME_LIMIT, INF_OR_UNBD
-            return {
-                 'status': GRB.Status[model.status],
-                 'objective': None,
-                 'solution': None
-            }
+            return {'status': model_copy.status, 'objective': None, 'solution': None}
+
     except gp.GurobiError as e:
-        print(f"Gurobi Error: {e}")
-        return {
-             'status':  'ERROR',
-             'objective': None,
-             'solution': None
-        }
+        return {'status': f'GUROBI_ERROR: {e}', 'objective': None, 'solution': None}
     finally:
-        model.dispose() # Release Gurobi resources
+        if model_copy:
+            model_copy.dispose()

@@ -1,64 +1,62 @@
-import gurobipy as gp
-from typing import Dict, Optional, List, Tuple
+# solver/heuristics.py
+
+import math
+from typing import Dict, List, Optional, Tuple
 from solver.problem import MIPProblem
 from solver.gurobi_interface import solve_lp_relaxation
-from solver.utilities import setup_logger
-import math
 
-logger = setup_logger()
-
-def find_initial_solution(problem: MIPProblem, current_lp_solution: Dict[str, float], current_constraints: List[Tuple[str, str, float]]) -> Optional[Dict[str, float]]:
+def find_initial_solution(
+    problem: MIPProblem,
+    starting_solution: Dict[str, float],
+    initial_constraints: List[Tuple[str, str, float]],
+    time_limit: Optional[float], # <-- ADD THIS ARGUMENT
+    max_depth: int = 10
+) -> Optional[Dict[str, float]]:
     """
-    Implements a simple diving heuristic to find an initial integer-feasible solution.
-    It tries to round fractional variables and solve subsequent LPs.
-
-    Args:
-        problem (MIPProblem): The MIPProblem instance.
-        current_lp_solution (Dict[str, float]): The LP solution from which to start diving.
-        current_constraints (List[Tuple[str, str, float]]): Constraints active at the current node.
-
-    Returns:
-        Optional[Dict[str, float]]: An initial integer-feasible solution if found, otherwise None.
+    A simple diving heuristic to find an initial integer-feasible solution.
+    This version now correctly passes the time limit.
     """
-    # Check if the current solution is already integer-feasible
-    is_integer_feasible = True
-    fractional_vars = []
-    for var_name in problem.integer_variable_names:
-        if var_name in current_lp_solution:
-            val = current_lp_solution[var_name]
-            if abs(val - round(val)) > 1e-6:
-                is_integer_feasible = False
-                fractional_vars.append(var_name)
 
-    if is_integer_feasible:
-        logger.info("Diving heuristic found an integer-feasible solution.")
-        return current_lp_solution
+    def dive(current_solution, constraints, depth):
+        # Base case: max depth reached or no time left
+        if depth >= max_depth or (time_limit is not None and time_limit <= 0):
+            return None
 
-    if not fractional_vars:
-        return None # No fractional variables to branch on, but not integer feasible (shouldn't happen if check above is correct)
+        # Check for integer feasibility
+        is_feasible = all(
+            abs(current_solution.get(var, 0) - round(current_solution.get(var, 0))) < 1e-6
+            for var in problem.integer_variable_names
+        )
+        if is_feasible:
+            return current_solution
 
-    # Select a fractional variable to dive on (e.g., the first one found)
-    branch_var_name = fractional_vars[0]
-    branch_val = current_lp_solution[branch_var_name]
+        # Find the most fractional variable to dive on
+        fractional_vars = [
+            var for var in problem.integer_variable_names
+            if abs(current_solution.get(var, 0) - round(current_solution.get(var, 0))) > 1e-6
+        ]
+        if not fractional_vars:
+            return None # Should be feasible, but as a safeguard
 
-    # Try rounding down
-    logger.debug(f"Diving: Trying {branch_var_name} <= {math.floor(branch_val)}")
-    constraints_down = current_constraints + [(branch_var_name, '<=', float(math.floor(branch_val)))]
-    lp_result_down = solve_lp_relaxation(problem, constraints_down)
+        branch_var = max(fractional_vars, key=lambda v: abs(current_solution[v] - round(current_solution[v])))
+        val = current_solution[branch_var]
 
-    if lp_result_down['status'] == 'OPTIMAL':
-        solution_down = find_initial_solution(problem, lp_result_down['solution'], constraints_down)
-        if solution_down:
-            return solution_down
+        # Try diving down first
+        constraints_down = constraints + [(branch_var, '<=', math.floor(val))]
+        lp_result_down = solve_lp_relaxation(problem, constraints_down, time_limit=time_limit) # <-- PASS TIME LIMIT
+        if lp_result_down.get('status') == 'OPTIMAL':
+            solution = dive(lp_result_down['solution'], constraints_down, depth + 1)
+            if solution:
+                return solution
 
-    # Try rounding up
-    logger.debug(f"Diving: Trying {branch_var_name} >= {math.ceil(branch_val)}")
-    constraints_up = current_constraints + [(branch_var_name, '>=', float(math.ceil(branch_val)))]
-    lp_result_up = solve_lp_relaxation(problem, constraints_up)
+        # If that fails, try diving up
+        constraints_up = constraints + [(branch_var, '>=', math.ceil(val))]
+        lp_result_up = solve_lp_relaxation(problem, constraints_up, time_limit=time_limit) # <-- PASS TIME LIMIT
+        if lp_result_up.get('status') == 'OPTIMAL':
+            solution = dive(lp_result_up['solution'], constraints_up, depth + 1)
+            if solution:
+                return solution
 
-    if lp_result_up['status'] == 'OPTIMAL':
-        solution_up = find_initial_solution(problem, lp_result_up['solution'], constraints_up)
-        if solution_up:
-            return solution_up
+        return None
 
-    return None
+    return dive(starting_solution, initial_constraints, 0)

@@ -1,16 +1,20 @@
 import time
 import yaml
 import math
+import logging # Import the logging module
 import gurobipy as gp
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple
 
 from solver.problem import MIPProblem
 from solver.node import Node
 from solver.gurobi_interface import solve_lp_relaxation
 from solver.heuristics import find_initial_solution
-from solver.utilities import setup_logger
 
-logger = setup_logger()
+# --- THIS IS THE CORRECT WAY TO GET THE LOGGER ---
+# We get the logger instance that was already configured in main.py.
+# We do NOT call setup_logger() here.
+logger = logging.getLogger(__name__)
+# ----------------------------------------------------
 
 class TreeManager:
     """
@@ -35,8 +39,7 @@ class TreeManager:
         self.node_counter: int = 0
         self.optimality_gap = self.config['solver_params']['optimality_gap']
         self.time_limit_seconds = self.config['solver_params']['time_limit_seconds']
-
-        logger.info(f"Initialized TreeManager with problem: {problem_path} and config: {config_path}")
+        logger.info(f"Initialized TreeManager for problem: {problem_path}")
 
     def _is_integer_feasible(self, solution: Dict[str, float], tolerance: float = 1e-6) -> bool:
         """
@@ -112,100 +115,92 @@ class TreeManager:
 
     def solve(self):
         """
-        Runs the Branch and Bound algorithm to solve the MIP problem.
+        Runs the full Branch and Bound algorithm to solve the MIP problem.
+        This version correctly manages and passes the time limit to all LP solves.
         """
-        logger.info("Starting Branch and Bound solver...")
+        logger.info("Starting Branch and Bound algorithm...")
+        start_time = time.time()  # Start the master clock immediately
 
-        # Create the root Node (ID 0, no constraints)
+        # --- Step 1: Solve the Root Node ---
+        # Inside the solve() method
         root_node = Node(
             node_id=self.node_counter,
             parent_id=None,
             local_constraints=[],
-            lp_objective=None,
-            lp_solution=None,
-            status='PENDING'
+            lp_objective=None,      # <-- Restore this line
+            lp_solution=None,       # <-- Restore this line
+            status='PENDING'        # <-- Restore this line
         )
         self.node_counter += 1
 
-        # Solve the root node's LP relaxation
-        logger.info(f"Solving root node {root_node.node_id} LP relaxation...")
-        lp_result = solve_lp_relaxation(self.problem, root_node.local_constraints)
+        logger.info(f"Solving root node {root_node.node_id}...")
+        # For the root solve, we pass the full time limit from the config.
+        lp_result = solve_lp_relaxation(self.problem, root_node.local_constraints, time_limit=self.time_limit_seconds)
 
-        if lp_result['status'] == 'OPTIMAL':
-            root_node.lp_objective = lp_result['objective']
-            root_node.lp_solution = lp_result['solution']
-            root_node.status = 'SOLVED'
-            self.global_best_bound = root_node.lp_objective # Initial global best bound
-            self.active_nodes.append(root_node)
-            logger.info(f"Root node {root_node.node_id} solved. LP Objective: {root_node.lp_objective:.4f}")
+        # Check if the root solve was successful
+        if lp_result.get('status') not in ['OPTIMAL', 'TIME_LIMIT']:
+            logger.error(f"Root node LP failed. Status: {lp_result.get('status')}. Aborting.")
+            return None, None
+        
+        # Even if time limit was hit, we might have a valid bound to start with.
+        if lp_result.get('objective') is None:
+             logger.error(f"Root node solve did not produce a valid objective. Aborting.")
+             return None, None
 
-            # Try to find an initial integer solution using the diving heuristic from the root LP solution
-            initial_solution_from_heuristic = find_initial_solution(self.problem, root_node.lp_solution, root_node.local_constraints)
-            if initial_solution_from_heuristic:
-                # Evaluate the objective of the initial solution
+        root_node.lp_objective = lp_result['objective']
+        root_node.lp_solution = lp_result['solution']
+        root_node.status = 'SOLVED'
+        self.global_best_bound = root_node.lp_objective
+        self.active_nodes.append(root_node)
+        logger.info(f"Root node solved. Best Possible Bound: {self.global_best_bound:.4f}")
+
+        # --- Step 2: Heuristic for Initial Solution ---
+        if root_node.lp_solution:
+            remaining_time = self.time_limit_seconds - (time.time() - start_time)
+            heuristic_solution = find_initial_solution(self.problem, root_node.lp_solution, root_node.local_constraints, time_limit=remaining_time)
+            if heuristic_solution:
                 obj_expr = self.problem.model.getObjective()
-                initial_obj_val = sum(initial_solution_from_heuristic[v.VarName] * v.Obj for v in self.problem.model.getVars() if v.VarName in initial_solution_from_heuristic)
+                self.incumbent_objective = sum(
+                    heuristic_solution.get(v.VarName, 0) * v.Obj 
+                    for v in self.problem.model.getVars()
+                )
+                self.incumbent_solution = heuristic_solution
+                logger.info(f"Heuristic found an initial integer solution! New Incumbent Objective: {self.incumbent_objective:.4f}")
 
-                self.incumbent_solution = initial_solution_from_heuristic
-                self.incumbent_objective = initial_obj_val
-                logger.info(f"Found initial incumbent solution via diving heuristic. Objective: {self.incumbent_objective:.4f}")
-        elif lp_result['status'] == 'INFEASIBLE':
-            root_node.status = 'PRUNED_INFEASIBLE'
-            logger.info(f"Root node {root_node.node_id} is infeasible. Pruning.")
-            return # No feasible solution
-        else:
-            logger.error(f"Root node {root_node.node_id} LP relaxation failed with status: {lp_result['status']}")
-            return # Error or other unhandled status
-
-        # Main Branch and Bound loop
-        start_time = time.time()
+        # --- Step 3: Main Branch and Bound Loop ---
         while self.active_nodes:
-            # Check time limit
-            if time.time() - start_time > self.time_limit_seconds:
+            # --- Termination Checks ---
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= self.time_limit_seconds:
                 logger.info(f"Time limit of {self.time_limit_seconds} seconds reached. Terminating solver.")
                 break
 
-            # Calculate and check optimality gap
-            if self.incumbent_objective is not None and self.global_best_bound is not None:
-                # For maximization, gap = (incumbent - best_bound) / |incumbent|
-                # For minimization, gap = (best_bound - incumbent) / |incumbent|
-                if self.incumbent_objective != 0:
-                    if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
-                        gap = (self.incumbent_objective - self.global_best_bound) / abs(self.incumbent_objective)
-                    else: # MINIMIZE
-                        gap = (self.global_best_bound - self.incumbent_objective) / abs(self.incumbent_objective)
-                    
-                    if gap <= self.optimality_gap:
-                        logger.info(f"Optimality gap ({gap:.6f}) reached {self.optimality_gap}. Terminating solver.")
-                        break
-
-            # a. Select Node
-            current_node: Optional[Node] = None
+            if self.incumbent_objective is not None and abs(self.incumbent_objective) > 1e-9:
+                gap = abs(self.global_best_bound - self.incumbent_objective) / abs(self.incumbent_objective)
+                if gap <= self.optimality_gap:
+                    logger.info(f"Optimality gap ({gap:.6f}) reached target ({self.optimality_gap}). Terminating solver.")
+                    break
+            
+            # --- Node Selection (Your existing logic is fine here) ---
             node_selection_strategy = self.config['strategy']['node_selection']
-
-            if node_selection_strategy == 'best_bound':
-                # Find the node with the best LP objective (min for minimize, max for maximize)
+            if node_selection_strategy == 'depth_first':
+                current_node = self.active_nodes.pop()
+            else:  # Default to 'best_bound'
+                key_func = lambda n: n.lp_objective or (-math.inf if self.problem.model.ModelSense == gp.GRB.MAXIMIZE else math.inf)
                 if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
-                    current_node = max(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else -math.inf)
+                    current_node = max(self.active_nodes, key=key_func)
                 else:
-                    current_node = min(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else math.inf)
-            elif node_selection_strategy == 'depth_first':
-                current_node = self.active_nodes[-1] # Most recently added
-            elif node_selection_strategy == 'best_estimate':
-                # For now, best_estimate behaves like best_bound. Future enhancement: incorporate pseudo-costs.
-                if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
-                    current_node = max(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else -math.inf)
-                else:
-                    current_node = min(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else math.inf)
-            else:
-                logger.error(f"Unsupported node selection strategy: {node_selection_strategy}")
-                break
-
-            if current_node is None:
-                break # Should not happen if active_nodes is not empty
-
-            self.active_nodes.remove(current_node)
-            logger.info(f"Processing node {current_node.node_id}. LP Objective: {current_node.lp_objective:.4f}")
+                    current_node = min(self.active_nodes, key=key_func)
+                self.active_nodes.remove(current_node)
+            
+            # --- Enhanced Logging ---
+            inc_obj_str = f"{self.incumbent_objective:.2f}" if self.incumbent_objective is not None else "None"
+            logger.info(
+                f"Processing Node {current_node.node_id} "
+                f"[Obj: {current_node.lp_objective:.2f}, "
+                f"Best Int: {inc_obj_str}, "
+                f"Nodes Left: {len(self.active_nodes)}]"
+            )
 
             # b. Process Node & c. Pruning/Fathoming
             # Check if the node's LP objective is worse than the current incumbent
@@ -239,74 +234,46 @@ class TreeManager:
                 current_node.status = 'FATHOMED'
                 continue # Fathom this node
 
-            # d. Branching
+            # --- Branching ---
+            remaining_time = self.time_limit_seconds - (time.time() - start_time)
+            if remaining_time <= 0:
+                logger.info("No time remaining for child nodes. Terminating.")
+                break
+
             branch_var_name = self._get_branching_variable(current_node.lp_solution, current_node.local_constraints)
-            if branch_var_name is None:
-                logger.info(f"Node {current_node.node_id} has no fractional integer variables to branch on. Fathoming.")
-                current_node.status = 'FATHOMED'
+            if not branch_var_name:
                 continue
 
             branch_val = current_node.lp_solution[branch_var_name]
-            branch_val_floor = math.floor(branch_val)
-            branch_val_ceil = math.ceil(branch_val)
+            
+            for sense, bound in [('<=', math.floor(branch_val)), ('>=', math.ceil(branch_val))]:
+                child_constraints = current_node.local_constraints + [(branch_var_name, sense, bound)]
+                child_node = Node(
+                    node_id=self.node_counter,
+                    parent_id=current_node.node_id,
+                    local_constraints=child_constraints,
+                    lp_objective=None,   
+                    lp_solution=None,       
+                    status='PENDING'       
+                )
+                self.node_counter += 1
 
-            logger.info(f"Branching on variable {branch_var_name} with value {branch_val:.4f} from node {current_node.node_id}")
+                # PASS THE CALCULATED REMAINING TIME TO THE CHILD SOLVE
+                child_lp_result = solve_lp_relaxation(self.problem, child_node.local_constraints, time_limit=remaining_time)
 
-            # Child A: x <= floor(val)
-            child_a_constraints = current_node.local_constraints + [(branch_var_name, '<=', float(branch_val_floor))]
-            child_a = Node(
-                node_id=self.node_counter,
-                parent_id=current_node.node_id,
-                local_constraints=child_a_constraints,
-                lp_objective=None,
-                lp_solution=None,
-                status='PENDING'
-            )
-            self.node_counter += 1
-
-            # Child B: x >= ceil(val)
-            child_b_constraints = current_node.local_constraints + [(branch_var_name, '>=', float(branch_val_ceil))]
-            child_b = Node(
-                node_id=self.node_counter,
-                parent_id=current_node.node_id,
-                local_constraints=child_b_constraints,
-                lp_objective=None,
-                lp_solution=None,
-                status='PENDING'
-            )
-            self.node_counter += 1
-
-            # Solve children LP relaxations
-            for child_node in [child_a, child_b]:
-                logger.info(f"Solving child node {child_node.node_id} LP relaxation...")
-                child_lp_result = solve_lp_relaxation(self.problem, child_node.local_constraints)
-
-                if child_lp_result['status'] == 'OPTIMAL':
+                if child_lp_result.get('status') in ['OPTIMAL', 'TIME_LIMIT'] and child_lp_result.get('objective') is not None:
                     child_node.lp_objective = child_lp_result['objective']
                     child_node.lp_solution = child_lp_result['solution']
                     child_node.status = 'SOLVED'
-
-                    # Prune by bound if child's LP objective is worse than current incumbent
-                    if self.incumbent_objective is not None:
-                        if (self.problem.model.ModelSense == gp.GRB.MAXIMIZE and child_node.lp_objective <= self.incumbent_objective) or \
-                           (self.problem.model.ModelSense == gp.GRB.MINIMIZE and child_node.lp_objective >= self.incumbent_objective):
-                            logger.info(f"Child node {child_node.node_id} pruned by bound. LP Obj ({child_node.lp_objective:.4f}) vs Incumbent ({self.incumbent_objective:.4f})")
-                            child_node.status = 'PRUNED_BY_BOUND'
-                            continue
-
                     self.active_nodes.append(child_node)
-                    logger.info(f"Child node {child_node.node_id} solved. LP Objective: {child_node.lp_objective:.4f}")
-                elif child_lp_result['status'] == 'INFEASIBLE':
-                    child_node.status = 'PRUNED_INFEASIBLE'
-                    logger.info(f"Child node {child_node.node_id} is infeasible. Pruning.")
                 else:
-                    logger.warning(f"Child node {child_node.node_id} LP relaxation failed with status: {child_lp_result['status']}. Pruning.")
-                    child_node.status = 'PRUNED_ERROR'
+                    logger.debug(f"Child node {child_node.node_id} pruned due to infeasibility or solver error.")
 
+        # --- Final Summary ---
         logger.info("Branch and Bound solver finished.")
         if self.incumbent_solution:
-            logger.info(f"Optimal solution found. Objective: {self.incumbent_objective:.4f}")
+            logger.info(f"Final incumbent solution found. Objective: {self.incumbent_objective:.4f}")
         else:
             logger.info("No integer-feasible solution found.")
-
+        
         return self.incumbent_solution, self.incumbent_objective
