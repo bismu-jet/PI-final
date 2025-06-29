@@ -23,7 +23,12 @@ def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, 
     """
     # Create a copy of the base Gurobi model to avoid modifying the original
     model = problem.model.copy()
-    model.setParam("OutputFlag", 0)  # Suppress Gurobi output
+    model.setParam("OutputFlag", 1)  # Suppress Gurobi output
+
+    for var in model.getVars():
+        if var.VType in [GRB.BINARY, GRB.INTEGER]:
+            var.VType = GRB.CONTINUOUS
+    # --- END OF THE NEW CODE BLOCK ---
 
     # Apply local constraints
     for var_name, sense, rhs in local_constraints:
@@ -48,13 +53,8 @@ def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, 
     model.setParam('LogToConsole', 1) 
     # -----------------------------------
     try:
-        # --- TEMPORARY DEBUGGING LOGS ---
-        print("DEBUG: About to call model.optimize(). This might take a while...")
-        # ------------------------------------
+
         model.optimize()
-        # --- TEMPORARY DEBUGGING LOGS ---
-        print("DEBUG: model.optimize() has finished.")
-        # ------------------------------------
 
         if model.status== GRB.OPTIMAL:
             return {
