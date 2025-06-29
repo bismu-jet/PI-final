@@ -8,6 +8,7 @@ from solver.problem import MIPProblem
 from solver.node import Node
 from solver.gurobi_interface import solve_lp_relaxation
 from solver.heuristics import find_initial_solution
+from solver.cuts import generate_gomory_cuts
 from solver.utilities import setup_logger
 
 logger = setup_logger()
@@ -35,6 +36,10 @@ class TreeManager:
         self.node_counter: int = 0
         self.optimality_gap = self.config['solver_params']['optimality_gap']
         self.time_limit_seconds = self.config['solver_params']['time_limit_seconds']
+
+        # Pseudo-cost branching attributes
+        self.pseudo_costs: Dict[str, Dict[str, float]] = {var_name: {"down_sum": 0.0, "down_count": 0, "up_sum": 0.0, "up_count": 0} for var_name in self.problem.integer_variable_names}
+        self.pseudo_cost_init_nodes = 10 # Number of nodes to use strong branching for initialization
 
         logger.info(f"Initialized TreeManager with problem: {problem_path} and config: {config_path}")
 
@@ -75,7 +80,8 @@ class TreeManager:
                     max_fractionality = fractional_part
                     best_var = var_name
             return best_var
-        elif strategy == "strong_branching":
+        elif strategy == "strong_branching" or (strategy == "pseudo_cost" and self.node_counter < self.pseudo_cost_init_nodes):
+            logger.debug(f"Using strong branching for initialization (node {self.node_counter}/{self.pseudo_cost_init_nodes})")
             best_var = None
             max_obj_change = -math.inf
 
@@ -106,6 +112,29 @@ class TreeManager:
                     max_obj_change = obj_change
                     best_var = var_name
             return best_var
+        elif strategy == "pseudo_cost":
+            best_var = None
+            max_pseudo_cost_sum = -math.inf
+
+            for var_name in fractional_vars:
+                pc_data = self.pseudo_costs[var_name]
+                down_pc = pc_data["down_sum"] / max(1, pc_data["down_count"])
+                up_pc = pc_data["up_sum"] / max(1, pc_data["up_count"])
+
+                # If no pseudo-cost data yet, use a fallback (e.g., strong branching or most fractional)
+                if pc_data["down_count"] == 0 and pc_data["up_count"] == 0:
+                    # Fallback to most fractional for variables with no pseudo-cost data yet
+                    # This part could be more sophisticated, e.g., run strong branching for these vars
+                    fractional_part = abs(solution[var_name] - round(solution[var_name]))
+                    current_pseudo_cost_sum = fractional_part # Simple fallback
+                else:
+                    # Simple sum of pseudo-costs for now. Could be weighted by fractionality.
+                    current_pseudo_cost_sum = down_pc + up_pc
+
+                if current_pseudo_cost_sum > max_pseudo_cost_sum:
+                    max_pseudo_cost_sum = current_pseudo_cost_sum
+                    best_var = var_name
+            return best_var
         else:
             logger.warning(f"Unsupported branching variable strategy: {strategy}")
             return None
@@ -127,7 +156,7 @@ class TreeManager:
         )
         self.node_counter += 1
 
-        # Solve the root node's LP relaxation
+        # Solve the root node\'s LP relaxation
         logger.info(f"Solving root node {root_node.node_id} LP relaxation...")
         lp_result = solve_lp_relaxation(self.problem, root_node.local_constraints)
 
@@ -168,7 +197,7 @@ class TreeManager:
             # Calculate and check optimality gap
             if self.incumbent_objective is not None and self.global_best_bound is not None:
                 # For maximization, gap = (incumbent - best_bound) / |incumbent|
-                # For minimization, gap = (best_bound - incumbent) / |incumbent|
+                # For minimization, gap = (best_best_bound - incumbent) / |incumbent|
                 if self.incumbent_objective != 0:
                     if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
                         gap = (self.incumbent_objective - self.global_best_bound) / abs(self.incumbent_objective)
@@ -208,7 +237,7 @@ class TreeManager:
             logger.info(f"Processing node {current_node.node_id}. LP Objective: {current_node.lp_objective:.4f}")
 
             # b. Process Node & c. Pruning/Fathoming
-            # Check if the node's LP objective is worse than the current incumbent
+            # Check if the node\'s LP objective is worse than the current incumbent
             if self.incumbent_objective is not None:
                 if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
                     if current_node.lp_objective <= self.incumbent_objective: # Prune by bound
@@ -222,11 +251,52 @@ class TreeManager:
                         continue
 
             # Check if the LP solution is integer-feasible
+            if current_node.lp_solution and not self._is_integer_feasible(current_node.lp_solution):
+                # Try to generate cuts
+                cuts_found = False
+                while True:
+                    new_cuts = generate_gomory_cuts(current_node.lp_solution, self.problem.model)
+                    if new_cuts:
+                        logger.info(f"Node {current_node.node_id}: Found {len(new_cuts)} Gomory cuts. Re-solving LP.")
+                        current_node.local_constraints.extend(new_cuts)
+                        lp_result = solve_lp_relaxation(self.problem, current_node.local_constraints)
+
+                        if lp_result["status"] == "OPTIMAL":
+                            current_node.lp_objective = lp_result["objective"]
+                            current_node.lp_solution = lp_result["solution"]
+                            current_node.status = "SOLVED"
+                            cuts_found = True
+                            # Re-check integer feasibility after adding cuts and re-solving
+                            if self._is_integer_feasible(current_node.lp_solution):
+                                logger.info(f"Node {current_node.node_id} became integer-feasible after adding cuts. Fathoming.")
+                                # Calculate actual objective for this integer solution
+                                current_objective = current_node.lp_objective
+                                if self.incumbent_objective is None or \
+                                   (self.problem.model.ModelSense == gp.GRB.MAXIMIZE and current_objective > self.incumbent_objective) or \
+                                   (self.problem.model.ModelSense == gp.GRB.MINIMIZE and current_objective < self.incumbent_objective):
+                                    self.incumbent_solution = current_node.lp_solution
+                                    self.incumbent_objective = current_objective
+                                    logger.info(f"New incumbent found! Objective: {self.incumbent_objective:.4f}")
+                                current_node.status = 'FATHOMED'
+                                break # Exit cut loop and fathom node
+                        elif lp_result["status"] == "INFEASIBLE":
+                            logger.info(f"Node {current_node.node_id} became infeasible after adding cuts. Pruning.")
+                            current_node.status = 'PRUNED_INFEASIBLE'
+                            break # Exit cut loop and prune node
+                        else:
+                            logger.warning(f"Node {current_node.node_id} LP relaxation failed after adding cuts with status: {lp_result["status"]}. Pruning.")
+                            current_node.status = 'PRUNED_ERROR'
+                            break # Exit cut loop and prune node
+                    else:
+                        break # No more cuts found
+                
+                if current_node.status != 'SOLVED': # If node was pruned or fathomed during cut generation
+                    continue # Skip branching and go to next node
+
+            # Check if the LP solution is integer-feasible after potential cut generation
             if current_node.lp_solution and self._is_integer_feasible(current_node.lp_solution):
-                logger.info(f"Node {current_node.node_id} found integer-feasible solution.")
+                logger.info(f"Node {current_node.node_id} found integer-feasible solution (possibly after cuts). Fathoming.")
                 # Calculate actual objective for this integer solution
-                # This requires evaluating the original model's objective with the integer solution
-                # For simplicity, using LP objective as incumbent objective for now. This needs refinement.
                 current_objective = current_node.lp_objective
 
                 if self.incumbent_objective is None or \
@@ -239,6 +309,7 @@ class TreeManager:
                 current_node.status = 'FATHOMED'
                 continue # Fathom this node
 
+            # If still fractional after cuts, proceed to branching
             # d. Branching
             branch_var_name = self._get_branching_variable(current_node.lp_solution, current_node.local_constraints)
             if branch_var_name is None:
@@ -286,7 +357,7 @@ class TreeManager:
                     child_node.lp_solution = child_lp_result['solution']
                     child_node.status = 'SOLVED'
 
-                    # Prune by bound if child's LP objective is worse than current incumbent
+                    # Prune by bound if child\'s LP objective is worse than current incumbent
                     if self.incumbent_objective is not None:
                         if (self.problem.model.ModelSense == gp.GRB.MAXIMIZE and child_node.lp_objective <= self.incumbent_objective) or \
                            (self.problem.model.ModelSense == gp.GRB.MINIMIZE and child_node.lp_objective >= self.incumbent_objective):
@@ -296,6 +367,16 @@ class TreeManager:
 
                     self.active_nodes.append(child_node)
                     logger.info(f"Child node {child_node.node_id} solved. LP Objective: {child_node.lp_objective:.4f}")
+
+                    # Update pseudo-costs
+                    if current_node.lp_objective is not None and child_node.lp_objective is not None:
+                        obj_change = abs(child_node.lp_objective - current_node.lp_objective)
+                        if child_node.node_id % 2 == 0: # Assuming even IDs for down branch, odd for up
+                            self.pseudo_costs[branch_var_name]["down_sum"] += obj_change
+                            self.pseudo_costs[branch_var_name]["down_count"] += 1
+                        else:
+                            self.pseudo_costs[branch_var_name]["up_sum"] += obj_change
+                            self.pseudo_costs[branch_var_name]["up_count"] += 1
                 elif child_lp_result['status'] == 'INFEASIBLE':
                     child_node.status = 'PRUNED_INFEASIBLE'
                     logger.info(f"Child node {child_node.node_id} is infeasible. Pruning.")

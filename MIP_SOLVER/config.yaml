@@ -1,6 +1,6 @@
 # Solver settings
 solver_params:
-  time_limit_seconds: 20 # Maximum duration for the solver to run.
+  time_limit_seconds: 3600 # Maximum duration for the solver to run.
   optimality_gap: 0.0001   # The relative gap to prove optimality.
 
 # Branch and Bound strategy
@@ -10,5 +10,5 @@ strategy:
   node_selection: 'best_bound'
 
   # How to select the variable to branch on.
-  # Options: 'most_fractional', 'strong_branching'
+  # Options: 'most_fractional', 'strong_branching', 'pseudo_cost'
   branching_variable: 'most_fractional'
