@@ -40,12 +40,21 @@ def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, 
             raise ValueError(f"Unsupported constraint sense: {sense}")
 
     # Set Gurobi parameters to ensure it only solves the LP relaxation
-    model.setParam("Presolve", 0)
-    model.setParam("Cuts", 0)
-    model.setParam("Heuristics", 0)
-
+    model.setParam('Presolve', 0)
+    model.setParam('Cuts', 0)
+    model.setParam('Heuristics', 0)
+    
+    # --- ADD THIS LINE FOR DEBUGGING ---
+    model.setParam('LogToConsole', 1) 
+    # -----------------------------------
     try:
+        # --- TEMPORARY DEBUGGING LOGS ---
+        print("DEBUG: About to call model.optimize(). This might take a while...")
+        # ------------------------------------
         model.optimize()
+        # --- TEMPORARY DEBUGGING LOGS ---
+        print("DEBUG: model.optimize() has finished.")
+        # ------------------------------------
 
         if model.status== GRB.OPTIMAL:
             return {
