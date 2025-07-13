@@ -64,18 +64,30 @@ def solve_lp_relaxation(problem: MIPProblem,
 
     return result
 
-# --- NEW FUNCTION FOR FEASIBILITY PUMP ---
 def solve_lp_with_custom_objective(problem: MIPProblem, 
-                                   objective_expr: gp.LinExpr) -> Dict[str, Any]:
+                                   objective_coeffs: Dict[str, float]) -> Dict[str, Any]:
     """
-    Solves an LP with a custom objective function, used by heuristics like Feasibility Pump.
+    Solves an LP with a custom objective function, built from a dictionary.
     """
     result = {'status': 'UNKNOWN'}
     model_copy = None
     try:
+        # This creates a new, local model instance.
         model_copy = problem.model.relax()
         
-        # Set the custom objective function
+        # --- THIS IS THE FIX ---
+        # 1. The function now accepts a dictionary `objective_coeffs`.
+        # 2. It builds the objective expression locally, using variables
+        #    that belong to its own `model_copy`. This prevents the
+        #    "Variable not in model" error.
+        objective_expr = gp.LinExpr()
+        for var_name, coeff in objective_coeffs.items():
+            # Get the variable object FROM THE LOCAL MODEL COPY.
+            var = model_copy.getVarByName(var_name)
+            if var is not None:
+                objective_expr.add(var, coeff)
+        # --- END FIX ---
+        
         model_copy.setObjective(objective_expr, GRB.MINIMIZE)
         
         model_copy.optimize()
@@ -85,7 +97,7 @@ def solve_lp_with_custom_objective(problem: MIPProblem,
             result['objective'] = model_copy.ObjVal
             result['solution'] = {v.VarName: v.X for v in model_copy.getVars()}
         else:
-            result['status'] = 'INFEASIBLE' # Or other non-optimal status
+            result['status'] = 'INFEASIBLE'
 
     except gp.GurobiError as e:
         logger.error(f"A Gurobi error occurred during custom objective LP solve: {e}")

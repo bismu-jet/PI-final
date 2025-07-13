@@ -11,9 +11,9 @@ solver_params:
 strategy:
   # Method for selecting the next node to explore from the active nodes list.
   # Options: 'best_bound', 'depth_first', 'hybrid'
-  node_selection: 'depth_first'
+  node_selection: 'hybrid'
   
   # Method for selecting the variable to branch on.
   # Options: 'most_fractional', 'strong_branching'
-  branching_variable: 'most_fractional'
+  branching_variable: 'pseudocost'
 

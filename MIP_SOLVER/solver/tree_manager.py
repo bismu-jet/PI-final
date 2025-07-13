@@ -20,13 +20,6 @@ class TreeManager:
     Manages the Branch and Bound tree, implementing the core solver logic.
     """
     def __init__(self, problem_path: str, config_path: str):
-        """
-        Initializes the TreeManager, loading configuration and the MIP problem.
-
-        Args:
-            problem_path (str): Path to the MIP problem file.
-            config_path (str): Path to the solver configuration file.
-        """
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
@@ -52,91 +45,80 @@ class TreeManager:
 
         self.cut_pool: List[Dict[str, Any]] = []
         
-        # --- NEW: Flag for hybrid strategy ---
         self.switched_to_best_bound = False
-        # ---
+
+        self.pseudocosts = {}
 
         logger.info(f"Initialized TreeManager with problem: {problem_path} and config: {config_path}")
 
     def _is_integer_feasible(self, solution: Dict[str, float], tolerance: float = 1e-6) -> bool:
-        """
-        Checks if a given solution is integer-feasible for all integer variables.
-        """
         for var_name in self.problem.integer_variable_names:
             if var_name in solution:
                 if abs(solution[var_name] - round(solution[var_name])) > tolerance:
                     return False
         return True
 
+    def _update_pseudocosts(self, var_name: str, direction: str, degradation: float):
+        if var_name not in self.pseudocosts:
+            self.pseudocosts[var_name] = {
+                'up': {'sum_degrad': 0.0, 'count': 0},
+                'down': {'sum_degrad': 0.0, 'count': 0}
+            }
+        
+        self.pseudocosts[var_name][direction]['sum_degrad'] += degradation
+        self.pseudocosts[var_name][direction]['count'] += 1
+        logger.debug(f"Updated pseudocost for '{var_name}' ({direction}): degradation={degradation:.4f}")
+
+    def _select_by_pseudocost(self, solution: Dict[str, float], fractional_vars: List[str]) -> str:
+        best_var = None
+        max_score = -1.0
+        
+        for var_name in fractional_vars:
+            val = solution[var_name]
+            frac_part = val - math.floor(val)
+            
+            pc_down_info = self.pseudocosts.get(var_name, {}).get('down', {})
+            pc_up_info = self.pseudocosts.get(var_name, {}).get('up', {})
+
+            # --- FIX: Use .get() with a default value to prevent KeyError ---
+            pc_down_count = pc_down_info.get('count', 0)
+            pc_up_count = pc_up_info.get('count', 0)
+
+            pc_down = (pc_down_info.get('sum_degrad', 0.0) / pc_down_count) if pc_down_count > 0 else 1.0
+            pc_up = (pc_up_info.get('sum_degrad', 0.0) / pc_up_count) if pc_up_count > 0 else 1.0
+            # --- END FIX ---
+            
+            score = (1 - frac_part) * pc_down + frac_part * pc_up
+            
+            if score > max_score:
+                max_score = score
+                best_var = var_name
+                
+        logger.info(f"Pseudocost choice: '{best_var}' with score {max_score:.4f}")
+        return best_var
+
     def _get_branching_variable(self, solution: Dict[str, float], current_constraints: List[Tuple[str, str, float]]) -> Optional[str]:
-        """
-        Selects a variable to branch on based on the configured strategy.
-        This version uses a more robust weighted score for strong branching.
-        """
         strategy = self.config["strategy"]["branching_variable"]
 
-        fractional_vars = []
-        for var_name in self.problem.integer_variable_names:
-            if var_name in solution:
-                val = solution[var_name]
-                if abs(val - round(val)) > 1e-6:
-                    fractional_vars.append(var_name)
+        fractional_vars = [
+            var_name for var_name in self.problem.integer_variable_names
+            if var_name in solution and abs(solution[var_name] - round(solution[var_name])) > 1e-6
+        ]
 
         if not fractional_vars:
             return None
 
         if strategy == "most_fractional":
-            best_var = None
-            max_fractionality = -1.0
-            for var_name in fractional_vars:
-                val = solution[var_name]
-                fractional_part = 0.5 - abs(val - math.floor(val) - 0.5)
-                if fractional_part > max_fractionality:
-                    max_fractionality = fractional_part
-                    best_var = var_name
-            return best_var
+            return max(fractional_vars, key=lambda v: 0.5 - abs(solution[v] - math.floor(solution[v]) - 0.5))
         
-        elif strategy == "strong_branching":
-            best_var = None
-            max_score = -1.0
-            parent_obj = solution['objective']
+        elif strategy == "pseudocost":
+            return self._select_by_pseudocost(solution, fractional_vars)
 
-            for var_name in fractional_vars:
-                val = solution[var_name]
-                floor_val = math.floor(val)
-                ceil_val = math.ceil(val)
-                fractional_part = val - floor_val
-
-                constraints_down = current_constraints + [(var_name, "<=", float(floor_val))]
-                lp_result_down = solve_lp_relaxation(self.problem, constraints_down)
-                
-                constraints_up = current_constraints + [(var_name, ">=", float(ceil_val))]
-                lp_result_up = solve_lp_relaxation(self.problem, constraints_up)
-
-                degradation_down = math.inf
-                if lp_result_down["status"] == "OPTIMAL":
-                    degradation_down = abs(lp_result_down["objective"] - parent_obj)
-
-                degradation_up = math.inf
-                if lp_result_up["status"] == "OPTIMAL":
-                    degradation_up = abs(lp_result_up["objective"] - parent_obj)
-                
-                score = (1 - fractional_part) * degradation_down + fractional_part * degradation_up
-                
-                if score > max_score:
-                    max_score = score
-                    best_var = var_name
-            
-            logger.info(f"Strong branching choice: '{best_var}' with score {max_score:.4f}")
-            return best_var
         else:
-            logger.warning(f"Unsupported branching variable strategy: {strategy}")
-            return None
+            logger.warning(f"Unsupported branching variable strategy: {strategy}, falling back to most_fractional.")
+            return max(fractional_vars, key=lambda v: 0.5 - abs(solution[v] - math.floor(solution[v]) - 0.5))
 
     def _find_violated_pool_cuts(self, solution: Dict[str, float]) -> List[Dict[str, Any]]:
-        """
-        Searches the global cut pool for cuts that are violated by the given solution.
-        """
         violated_cuts = []
         for cut in self.cut_pool:
             lhs_val = sum(coeff * solution.get(var_name, 0) for var_name, coeff in cut['coeffs'].items())
@@ -157,19 +139,9 @@ class TreeManager:
         return violated_cuts
 
     def solve(self):
-        """
-        Runs the Branch and Bound algorithm to solve the MIP problem.
-        """
         logger.info("Starting Branch and Bound solver...")
 
-        root_node = Node(
-            node_id=self.node_counter,
-            parent_id=None,
-            local_constraints=[],
-            lp_objective=None,
-            lp_solution=None,
-            status='PENDING'
-        )
+        root_node = Node(node_id=self.node_counter, parent_id=None, local_constraints=[], lp_objective=None, lp_solution=None, status='PENDING')
         self.node_counter += 1
 
         logger.info(f"Solving root node {root_node.node_id} LP relaxation...")
@@ -185,18 +157,18 @@ class TreeManager:
             self.active_nodes.append(root_node)
             logger.info(f"Root node {root_node.node_id} solved. LP Objective: {root_node.lp_objective:.4f}")
 
-            initial_solution_from_heuristic = find_initial_solution(self.problem, root_node.lp_solution, root_node.local_constraints)
-            if initial_solution_from_heuristic:
-                initial_obj_val = sum(initial_solution_from_heuristic.get(v.VarName, 0) * v.Obj for v in self.problem.model.getVars())
-                self.incumbent_solution = initial_solution_from_heuristic
-                self.incumbent_objective = initial_obj_val
-                logger.info(f"Found initial incumbent solution via diving heuristic. Objective: {self.incumbent_objective:.4f}")
-        elif lp_result['status'] == 'INFEASIBLE':
-            root_node.status = 'PRUNED_INFEASIBLE'
-            logger.info(f"Root node {root_node.node_id} is infeasible. Pruning.")
-            return None, None
+            candidate_integer_solution = find_initial_solution(self.problem, root_node.lp_solution, root_node.local_constraints)
+            if candidate_integer_solution:
+                fixed_vars_constraints = [(v, '==', float(round(val))) for v, val in candidate_integer_solution.items() if v in self.problem.integer_variable_names]
+                completion_lp_result = solve_lp_relaxation(self.problem, fixed_vars_constraints)
+                if completion_lp_result['status'] == 'OPTIMAL':
+                    self.incumbent_solution = completion_lp_result['solution']
+                    self.incumbent_objective = completion_lp_result['objective']
+                    logger.info(f"Found and verified initial incumbent solution via heuristic. Objective: {self.incumbent_objective:.4f}")
+                else:
+                    logger.warning("Heuristic solution was not extendable to a feasible solution.")
         else:
-            logger.error(f"Root node {root_node.node_id} LP relaxation failed with status: {lp_result['status']}")
+            logger.error(f"Root node LP failed with status: {lp_result['status']}. Terminating.")
             return None, None
 
         start_time = time.time()
@@ -204,59 +176,31 @@ class TreeManager:
             if time.time() - start_time > self.time_limit_seconds:
                 logger.info(f"Time limit of {self.time_limit_seconds} seconds reached. Terminating solver.")
                 break
+            
+            if self.is_maximization:
+                self.global_best_bound = max((node.lp_objective for node in self.active_nodes if node.lp_objective is not None), default=-math.inf)
+            else:
+                self.global_best_bound = min((node.lp_objective for node in self.active_nodes if node.lp_objective is not None), default=math.inf)
+            
+            logger.info(f"--- Nodes: {len(self.active_nodes)}, Global Best Bound: {self.global_best_bound:.4f}, Incumbent: {self.incumbent_objective} ---")
 
-            if self.incumbent_objective is not None and self.global_best_bound is not None:
+            if self.incumbent_objective is not None:
                 if abs(self.incumbent_objective) > 1e-9:
-                    if self.is_maximization:
-                        gap = (self.global_best_bound - self.incumbent_objective) / abs(self.incumbent_objective)
-                    else:
-                        gap = (self.incumbent_objective - self.global_best_bound) / abs(self.incumbent_objective)
-                    
+                    gap = abs(self.incumbent_objective - self.global_best_bound) / abs(self.incumbent_objective)
                     if gap <= self.optimality_gap:
                         logger.info(f"Optimality gap ({gap:.6f}) reached {self.optimality_gap}. Terminating solver.")
                         break
 
-            # --- MODIFIED NODE SELECTION LOGIC ---
-            current_node: Optional[Node] = None
             node_selection_strategy = self.config['strategy']['node_selection']
-
             if node_selection_strategy == 'best_bound':
-                if self.is_maximization:
-                    current_node = max(self.active_nodes, key=lambda node: node.lp_objective)
-                else:
-                    current_node = min(self.active_nodes, key=lambda node: node.lp_objective)
+                current_node = min(self.active_nodes, key=lambda node: node.lp_objective) if not self.is_maximization else max(self.active_nodes, key=lambda node: node.lp_objective)
                 self.active_nodes.remove(current_node)
-
-            elif node_selection_strategy == 'depth_first':
+            else: # 'depth_first' or 'hybrid' start
                 current_node = self.active_nodes.pop()
-            
-            elif node_selection_strategy == 'hybrid':
-                # Switch to best_bound once the first incumbent is found
-                if self.incumbent_solution is not None and not self.switched_to_best_bound:
-                    logger.info("Incumbent found. Switching node selection strategy to Best-Bound.")
-                    self.switched_to_best_bound = True
-                
-                if not self.switched_to_best_bound:
-                    # Use Depth-First Search until an incumbent is found
-                    current_node = self.active_nodes.pop()
-                else:
-                    # Use Best-Bound Search after an incumbent is found
-                    if self.is_maximization:
-                        current_node = max(self.active_nodes, key=lambda node: node.lp_objective)
-                    else:
-                        current_node = min(self.active_nodes, key=lambda node: node.lp_objective)
-                    self.active_nodes.remove(current_node)
-            
-            else:
-                logger.error(f"Unsupported node selection strategy: {node_selection_strategy}")
-                break
-            # --- END MODIFICATION ---
 
-            if current_node is None:
-                break 
-            
             logger.info(f"Processing node {current_node.node_id}. LP Objective: {current_node.lp_objective:.4f}")
             
+            # --- FIX: Restored the cut generation and application logic ---
             if not self._is_integer_feasible(current_node.lp_solution):
                 cuts_to_add = self._find_violated_pool_cuts(current_node.lp_solution)
                 
@@ -287,7 +231,8 @@ class TreeManager:
                     else:
                          logger.warning(f"LP re-solve failed with status {lp_result_after_cuts['status']}. Pruning node.")
                          continue
-            
+            # --- END FIX ---
+
             if self.incumbent_objective is not None:
                 if (self.is_maximization and current_node.lp_objective <= self.incumbent_objective) or \
                    (not self.is_maximization and current_node.lp_objective >= self.incumbent_objective):
@@ -295,25 +240,15 @@ class TreeManager:
                     continue
 
             if current_node.lp_solution and self._is_integer_feasible(current_node.lp_solution):
-                clean_integer_solution = {k: round(v) for k, v in current_node.lp_solution.items() if k in self.problem.integer_variable_names}
-                for v_name, v_val in current_node.lp_solution.items():
-                    if v_name not in clean_integer_solution:
-                        clean_integer_solution[v_name] = v_val
-
-                current_objective = sum(clean_integer_solution.get(v.VarName, 0) * v.Obj for v in self.problem.model.getVars())
-                
                 is_new_best = self.incumbent_objective is None or \
-                              (self.is_maximization and current_objective > self.incumbent_objective) or \
-                              (not self.is_maximization and current_objective < self.incumbent_objective)
-
+                              (self.is_maximization and current_node.lp_objective > self.incumbent_objective) or \
+                              (not self.is_maximization and current_node.lp_objective < self.incumbent_objective)
                 if is_new_best:
-                    self.incumbent_solution = clean_integer_solution
-                    self.incumbent_objective = current_objective
+                    self.incumbent_solution = current_node.lp_solution
+                    self.incumbent_objective = current_node.lp_objective
                     logger.info(f"New incumbent found! Objective: {self.incumbent_objective:.4f}")
-
                 continue
 
-            # Add the current node's objective to its solution dict for strong branching
             current_node.lp_solution['objective'] = current_node.lp_objective
             branch_var_name = self._get_branching_variable(current_node.lp_solution, current_node.local_constraints)
             if branch_var_name is None:
@@ -321,50 +256,32 @@ class TreeManager:
                 continue
 
             branch_val = current_node.lp_solution[branch_var_name]
-            branch_val_floor = math.floor(branch_val)
-            branch_val_ceil = math.ceil(branch_val)
-
             logger.info(f"Branching on variable {branch_var_name} with value {branch_val:.4f} from node {current_node.node_id}")
 
-            for sense, val in [('<=', float(branch_val_floor)), ('>=', float(branch_val_ceil))]:
+            for direction, sense, val in [('down', '<=', math.floor(branch_val)), ('up', '>=', math.ceil(branch_val))]:
                 child_constraints = current_node.local_constraints + [(branch_var_name, sense, val)]
-                child_node = Node(
-                    node_id=self.node_counter,
-                    parent_id=current_node.node_id,
-                    local_constraints=child_constraints,
-                    lp_objective=None,
-                    lp_solution=None,
-                    status='PENDING'
-                )
-                self.node_counter += 1
-
-                logger.info(f"Solving child node {child_node.node_id} LP relaxation...")
-                child_lp_result = solve_lp_relaxation(self.problem, child_node.local_constraints)
+                child_lp_result = solve_lp_relaxation(self.problem, child_constraints)
 
                 if child_lp_result['status'] == 'OPTIMAL':
-                    child_node.lp_objective = child_lp_result['objective']
-                    child_node.lp_solution = child_lp_result['solution']
-                    child_node.vbasis = child_lp_result.get('vbasis')
-                    child_node.cbasis = child_lp_result.get('cbasis')
-                    child_node.status = 'SOLVED'
-
-                    if self.incumbent_objective is not None:
-                        if (self.is_maximization and child_node.lp_objective <= self.incumbent_objective) or \
-                           (not self.is_maximization and child_node.lp_objective >= self.incumbent_objective):
-                            logger.info(f"Child node {child_node.node_id} pruned by bound upon creation.")
-                            continue
-
+                    degradation = abs(child_lp_result['objective'] - current_node.lp_objective)
+                    self._update_pseudocosts(branch_var_name, direction, degradation)
+                    
+                    if self.incumbent_objective is not None and \
+                       ((self.is_maximization and child_lp_result['objective'] <= self.incumbent_objective) or \
+                       (not self.is_maximization and child_lp_result['objective'] >= self.incumbent_objective)):
+                        logger.info(f"Child node pruned by bound upon creation.")
+                        continue
+                    
+                    child_node = Node(node_id=self.node_counter, parent_id=current_node.node_id, local_constraints=child_constraints, lp_objective=child_lp_result['objective'], lp_solution=child_lp_result['solution'], status='SOLVED', vbasis=child_lp_result.get('vbasis'), cbasis=child_lp_result.get('cbasis'))
+                    self.node_counter += 1
                     self.active_nodes.append(child_node)
-                    logger.info(f"Child node {child_node.node_id} solved. LP Objective: {child_node.lp_objective:.4f}")
-                elif child_lp_result['status'] == 'INFEASIBLE':
-                    logger.info(f"Child node {child_node.node_id} is infeasible. Pruning.")
+                    logger.info(f"Child node {child_node.node_id} created. LP Obj: {child_lp_result['objective']:.4f}")
                 else:
-                    logger.warning(f"Child node {child_node.node_id} LP relaxation failed with status: {child_lp_result['status']}. Pruning.")
-                    child_node.status = 'PRUNED_ERROR'
+                    logger.info(f"Child node is {child_lp_result['status']}. Pruning.")
 
         logger.info("Branch and Bound solver finished.")
         if self.incumbent_solution:
-            logger.info(f"Optimal solution found. Objective: {self.incumbent_objective:.4f}")
+            logger.info(f"Best solution found. Objective: {self.incumbent_objective:.4f}")
         else:
             logger.info("No integer-feasible solution found.")
 
