@@ -1,2 +1,4 @@
 gurobipy
-PyYAML
+pyyaml
+numpy
+scipy

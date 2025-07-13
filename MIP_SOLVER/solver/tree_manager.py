@@ -9,6 +9,7 @@ from solver.node import Node
 from solver.gurobi_interface import solve_lp_relaxation
 from solver.heuristics import find_initial_solution
 from solver.utilities import setup_logger
+from solver.presolve import presolve
 
 logger = setup_logger()
 
@@ -28,10 +29,24 @@ class TreeManager:
             self.config = yaml.safe_load(f)
 
         self.problem = MIPProblem(problem_path)
+        
+        # --- ROBUST INITIALIZATION ---
+        # Determine the model sense ONCE and store it in our own attribute.
+        self.is_maximization = self.problem.model.ModelSense == gp.GRB.MAXIMIZE
+        model_sense = "MAXIMIZE" if self.is_maximization else "MINIMIZE"
+        logger.info(f"Problem recognized as a {model_sense} problem.")
+        
+        logger.info("--- Starting Presolve Phase ---")
+        presolve(self.problem)
+        logger.info("--- Presolve Phase Finished ---")
+        
         self.active_nodes: List[Node] = []
         self.incumbent_solution: Optional[Dict[str, float]] = None
         self.incumbent_objective: Optional[float] = None
-        self.global_best_bound: float = -math.inf if self.problem.model.ModelSense == gp.GRB.MAXIMIZE else math.inf
+        
+        # Use our new attribute to set the initial bound correctly.
+        self.global_best_bound: float = -math.inf if self.is_maximization else math.inf
+        
         self.node_counter: int = 0
         self.optimality_gap = self.config['solver_params']['optimality_gap']
         self.time_limit_seconds = self.config['solver_params']['time_limit_seconds']
@@ -143,8 +158,7 @@ class TreeManager:
             initial_solution_from_heuristic = find_initial_solution(self.problem, root_node.lp_solution, root_node.local_constraints)
             if initial_solution_from_heuristic:
                 # Evaluate the objective of the initial solution
-                obj_expr = self.problem.model.getObjective()
-                initial_obj_val = sum(initial_solution_from_heuristic[v.VarName] * v.Obj for v in self.problem.model.getVars() if v.VarName in initial_solution_from_heuristic)
+                initial_obj_val = sum(initial_solution_from_heuristic.get(v.VarName, 0) * v.Obj for v in self.problem.model.getVars())
 
                 self.incumbent_solution = initial_solution_from_heuristic
                 self.incumbent_objective = initial_obj_val
@@ -167,13 +181,11 @@ class TreeManager:
 
             # Calculate and check optimality gap
             if self.incumbent_objective is not None and self.global_best_bound is not None:
-                # For maximization, gap = (incumbent - best_bound) / |incumbent|
-                # For minimization, gap = (best_bound - incumbent) / |incumbent|
-                if self.incumbent_objective != 0:
-                    if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
-                        gap = (self.incumbent_objective - self.global_best_bound) / abs(self.incumbent_objective)
-                    else: # MINIMIZE
+                if abs(self.incumbent_objective) > 1e-9:
+                    if self.is_maximization:
                         gap = (self.global_best_bound - self.incumbent_objective) / abs(self.incumbent_objective)
+                    else: # MINIMIZE
+                        gap = (self.incumbent_objective - self.global_best_bound) / abs(self.incumbent_objective)
                     
                     if gap <= self.optimality_gap:
                         logger.info(f"Optimality gap ({gap:.6f}) reached {self.optimality_gap}. Terminating solver.")
@@ -184,66 +196,62 @@ class TreeManager:
             node_selection_strategy = self.config['strategy']['node_selection']
 
             if node_selection_strategy == 'best_bound':
-                # Find the node with the best LP objective (min for minimize, max for maximize)
-                if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
-                    current_node = max(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else -math.inf)
+                if self.is_maximization:
+                    current_node = max(self.active_nodes, key=lambda node: node.lp_objective)
                 else:
-                    current_node = min(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else math.inf)
+                    current_node = min(self.active_nodes, key=lambda node: node.lp_objective)
             elif node_selection_strategy == 'depth_first':
-                current_node = self.active_nodes[-1] # Most recently added
+                current_node = self.active_nodes.pop() 
             elif node_selection_strategy == 'best_estimate':
-                # For now, best_estimate behaves like best_bound. Future enhancement: incorporate pseudo-costs.
-                if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
+                if self.is_maximization:
                     current_node = max(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else -math.inf)
                 else:
                     current_node = min(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else math.inf)
             else:
-                logger.error(f"Unsupported node selection strategy: {node_selection_strategy}")
+                logger.error(f"Unsupported node selection strategy: {strategy}")
                 break
 
             if current_node is None:
-                break # Should not happen if active_nodes is not empty
+                break 
 
-            self.active_nodes.remove(current_node)
+            if node_selection_strategy != 'depth_first':
+                self.active_nodes.remove(current_node)
+            
             logger.info(f"Processing node {current_node.node_id}. LP Objective: {current_node.lp_objective:.4f}")
 
             # b. Process Node & c. Pruning/Fathoming
             # Check if the node's LP objective is worse than the current incumbent
             if self.incumbent_objective is not None:
-                if self.problem.model.ModelSense == gp.GRB.MAXIMIZE:
+                if self.is_maximization:
                     if current_node.lp_objective <= self.incumbent_objective: # Prune by bound
                         logger.info(f"Node {current_node.node_id} pruned by bound. LP Obj ({current_node.lp_objective:.4f}) <= Incumbent ({self.incumbent_objective:.4f})")
-                        current_node.status = 'PRUNED_BY_BOUND'
                         continue
                 else: # MINIMIZE
                     if current_node.lp_objective >= self.incumbent_objective: # Prune by bound
                         logger.info(f"Node {current_node.node_id} pruned by bound. LP Obj ({current_node.lp_objective:.4f}) >= Incumbent ({self.incumbent_objective:.4f})")
-                        current_node.status = 'PRUNED_BY_BOUND'
                         continue
 
             # Check if the LP solution is integer-feasible
             if current_node.lp_solution and self._is_integer_feasible(current_node.lp_solution):
                 logger.info(f"Node {current_node.node_id} found integer-feasible solution.")
-                # Calculate actual objective for this integer solution
-                # This requires evaluating the original model's objective with the integer solution
-                # For simplicity, using LP objective as incumbent objective for now. This needs refinement.
-                current_objective = current_node.lp_objective
 
-                if self.incumbent_objective is None or \
-                   (self.problem.model.ModelSense == gp.GRB.MAXIMIZE and current_objective > self.incumbent_objective) or \
-                   (self.problem.model.ModelSense == gp.GRB.MINIMIZE and current_objective < self.incumbent_objective):
-                    self.incumbent_solution = current_node.lp_solution
+                current_objective = current_node.lp_objective
+                
+                is_new_best = self.incumbent_objective is None or \
+                              (self.is_maximization and current_objective > self.incumbent_objective) or \
+                              (not self.is_maximization and current_objective < self.incumbent_objective)
+
+                if is_new_best:
+                    self.incumbent_solution = {k: round(v) for k, v in current_node.lp_solution.items()}
                     self.incumbent_objective = current_objective
                     logger.info(f"New incumbent found! Objective: {self.incumbent_objective:.4f}")
 
-                current_node.status = 'FATHOMED'
                 continue # Fathom this node
 
             # d. Branching
             branch_var_name = self._get_branching_variable(current_node.lp_solution, current_node.local_constraints)
             if branch_var_name is None:
                 logger.info(f"Node {current_node.node_id} has no fractional integer variables to branch on. Fathoming.")
-                current_node.status = 'FATHOMED'
                 continue
 
             branch_val = current_node.lp_solution[branch_var_name]
@@ -286,18 +294,15 @@ class TreeManager:
                     child_node.lp_solution = child_lp_result['solution']
                     child_node.status = 'SOLVED'
 
-                    # Prune by bound if child's LP objective is worse than current incumbent
                     if self.incumbent_objective is not None:
-                        if (self.problem.model.ModelSense == gp.GRB.MAXIMIZE and child_node.lp_objective <= self.incumbent_objective) or \
-                           (self.problem.model.ModelSense == gp.GRB.MINIMIZE and child_node.lp_objective >= self.incumbent_objective):
-                            logger.info(f"Child node {child_node.node_id} pruned by bound. LP Obj ({child_node.lp_objective:.4f}) vs Incumbent ({self.incumbent_objective:.4f})")
-                            child_node.status = 'PRUNED_BY_BOUND'
+                        if (self.is_maximization and child_node.lp_objective <= self.incumbent_objective) or \
+                           (not self.is_maximization and child_node.lp_objective >= self.incumbent_objective):
+                            logger.info(f"Child node {child_node.node_id} pruned by bound upon creation.")
                             continue
 
                     self.active_nodes.append(child_node)
                     logger.info(f"Child node {child_node.node_id} solved. LP Objective: {child_node.lp_objective:.4f}")
                 elif child_lp_result['status'] == 'INFEASIBLE':
-                    child_node.status = 'PRUNED_INFEASIBLE'
                     logger.info(f"Child node {child_node.node_id} is infeasible. Pruning.")
                 else:
                     logger.warning(f"Child node {child_node.node_id} LP relaxation failed with status: {child_lp_result['status']}. Pruning.")
