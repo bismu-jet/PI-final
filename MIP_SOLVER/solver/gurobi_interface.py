@@ -1,19 +1,21 @@
 import gurobipy as gp
 from gurobipy import GRB
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 
 from solver.problem import MIPProblem
-from solver.utilities import setup_logger # We'll need this for error logging
+from solver.utilities import setup_logger
 
 logger = setup_logger()
 
-def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, str, float]]) -> Dict[str, Any]:
+def solve_lp_relaxation(problem: MIPProblem, 
+                        local_constraints: List[Tuple[str, str, float]], 
+                        cuts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     Solves the LP relaxation of the MIP problem.
-    It now assumes the base model has already been configured with the correct parameters.
+    It can optionally include a list of generated cuts.
     """
     result = {'status': 'UNKNOWN'}
-    relaxed_model = None # Define in this scope for the 'finally' block
+    relaxed_model = None
 
     try:
         # The .relax() method will create a new model that inherits the parent's environment and parameters.
@@ -22,7 +24,35 @@ def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, 
         # Apply local branching constraints
         for var_name, sense, value in local_constraints:
             var = relaxed_model.getVarByName(var_name)
-            relaxed_model.addConstr(var <= value if sense == '<=' else var >= value)
+            if sense == '<=':
+                relaxed_model.addConstr(var <= value)
+            elif sense == '>=':
+                relaxed_model.addConstr(var >= value)
+        
+        # --- CORRECTED: REBUILD CUT EXPRESSION FROM DATA ---
+        if cuts:
+            for i, cut in enumerate(cuts):
+                # Expects a dictionary like: {'coeffs': {'x1': 0.5, ...}, 'sense': ..., 'rhs': ...}
+                cut_coeffs_dict = cut['coeffs']
+                cut_rhs = cut['rhs']
+                cut_sense = cut['sense']
+                
+                # Create a new, empty expression within the current model's context
+                new_expr = gp.LinExpr()
+                for var_name, coeff in cut_coeffs_dict.items():
+                    # Get the variable object that belongs to THIS model
+                    var = relaxed_model.getVarByName(var_name)
+                    if var is not None:
+                        new_expr.add(var, coeff)
+                
+                # Add the newly constructed constraint
+                if cut_sense == GRB.GREATER_EQUAL:
+                    relaxed_model.addConstr(new_expr >= cut_rhs, name=f"gomory_{i}")
+                elif cut_sense == GRB.LESS_EQUAL:
+                    relaxed_model.addConstr(new_expr <= cut_rhs, name=f"gomory_{i}")
+                else: # GRB.EQUAL
+                    relaxed_model.addConstr(new_expr == cut_rhs, name=f"gomory_{i}")
+        # --- END CORRECTION ---
 
         relaxed_model.optimize()
 
@@ -42,7 +72,6 @@ def solve_lp_relaxation(problem: MIPProblem, local_constraints: List[Tuple[str, 
         result['status'] = 'ERROR'
     
     finally:
-        # Ensure the temporary model is always disposed of
         if relaxed_model:
             relaxed_model.dispose()
 

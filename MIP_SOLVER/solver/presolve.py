@@ -207,7 +207,7 @@ def tighten_coefficients(problem: MIPProblem):
         problem.remove_constraints_by_index(constrs_to_remove_indices)
         model.update()
         for c in constraints_to_add:
-            model.addConstr(c['expr'], sense=c['sense'], rhs=c['rhs'], name=c['name'])
+            model.addConstr(c['expr'] <= c['rhs'], name=c['name'])
         model.update()
 #NEXT STEPS: PROBING HERE
 

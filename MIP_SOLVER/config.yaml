@@ -1,6 +1,6 @@
 # Solver settings
 solver_params:
-  time_limit_seconds: 900 # Maximum duration for the solver to run.
+  time_limit_seconds: 30 # Maximum duration for the solver to run.
   optimality_gap: 0.0001   # The relative gap to prove optimality.
 
 # Branch and Bound strategy

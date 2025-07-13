@@ -4,6 +4,7 @@ import math
 import gurobipy as gp
 from typing import List, Dict, Optional, Tuple, Any
 
+from solver.cuts import generate_gomory_cuts
 from solver.problem import MIPProblem
 from solver.node import Node
 from solver.gurobi_interface import solve_lp_relaxation
@@ -149,6 +150,8 @@ class TreeManager:
         if lp_result['status'] == 'OPTIMAL':
             root_node.lp_objective = lp_result['objective']
             root_node.lp_solution = lp_result['solution']
+            root_node.vbasis = lp_result.get('vbasis')
+            root_node.cbasis = lp_result.get('cbasis')
             root_node.status = 'SOLVED'
             self.global_best_bound = root_node.lp_objective # Initial global best bound
             self.active_nodes.append(root_node)
@@ -166,10 +169,10 @@ class TreeManager:
         elif lp_result['status'] == 'INFEASIBLE':
             root_node.status = 'PRUNED_INFEASIBLE'
             logger.info(f"Root node {root_node.node_id} is infeasible. Pruning.")
-            return # No feasible solution
+            return None, None
         else:
             logger.error(f"Root node {root_node.node_id} LP relaxation failed with status: {lp_result['status']}")
-            return # Error or other unhandled status
+            return None, None
 
         # Main Branch and Bound loop
         start_time = time.time()
@@ -208,7 +211,7 @@ class TreeManager:
                 else:
                     current_node = min(self.active_nodes, key=lambda node: node.lp_objective if node.lp_objective is not None else math.inf)
             else:
-                logger.error(f"Unsupported node selection strategy: {strategy}")
+                logger.error(f"Unsupported node selection strategy: {node_selection_strategy}")
                 break
 
             if current_node is None:
@@ -218,31 +221,55 @@ class TreeManager:
                 self.active_nodes.remove(current_node)
             
             logger.info(f"Processing node {current_node.node_id}. LP Objective: {current_node.lp_objective:.4f}")
-
-            # b. Process Node & c. Pruning/Fathoming
-            # Check if the node's LP objective is worse than the current incumbent
+            
+            # --- CUT GENERATION LOGIC ---
+            if not self._is_integer_feasible(current_node.lp_solution):
+                logger.info(f"Node {current_node.node_id} is fractional. Attempting to generate cuts.")
+                
+                lp_result_for_cuts = {
+                    'solution': current_node.lp_solution,
+                    'vbasis': current_node.vbasis,
+                    'cbasis': current_node.cbasis,
+                    'local_constraints': current_node.local_constraints 
+                }
+                new_cuts = generate_gomory_cuts(self.problem, lp_result_for_cuts)
+                
+                if new_cuts:
+                    logger.info(f"Generated {len(new_cuts)} Gomory cuts. Re-solving LP for node {current_node.node_id}.")
+                    lp_result_after_cuts = solve_lp_relaxation(self.problem, current_node.local_constraints, cuts=new_cuts)
+                    
+                    if lp_result_after_cuts['status'] == 'OPTIMAL':
+                         logger.info(f"LP re-solve successful. New LP objective: {lp_result_after_cuts['objective']:.4f}")
+                         current_node.lp_objective = lp_result_after_cuts['objective']
+                         current_node.lp_solution = lp_result_after_cuts['solution']
+                         current_node.vbasis = lp_result_after_cuts.get('vbasis')
+                         current_node.cbasis = lp_result_after_cuts.get('cbasis')
+                    else:
+                         logger.warning(f"LP re-solve failed with status {lp_result_after_cuts['status']}. Pruning node.")
+                         continue
+            
+            # b. Pruning by bound
             if self.incumbent_objective is not None:
-                if self.is_maximization:
-                    if current_node.lp_objective <= self.incumbent_objective: # Prune by bound
-                        logger.info(f"Node {current_node.node_id} pruned by bound. LP Obj ({current_node.lp_objective:.4f}) <= Incumbent ({self.incumbent_objective:.4f})")
-                        continue
-                else: # MINIMIZE
-                    if current_node.lp_objective >= self.incumbent_objective: # Prune by bound
-                        logger.info(f"Node {current_node.node_id} pruned by bound. LP Obj ({current_node.lp_objective:.4f}) >= Incumbent ({self.incumbent_objective:.4f})")
-                        continue
+                if (self.is_maximization and current_node.lp_objective <= self.incumbent_objective) or \
+                   (not self.is_maximization and current_node.lp_objective >= self.incumbent_objective):
+                    logger.info(f"Node {current_node.node_id} pruned by bound.")
+                    continue
 
-            # Check if the LP solution is integer-feasible
+            # c. Fathoming by integer feasibility
             if current_node.lp_solution and self._is_integer_feasible(current_node.lp_solution):
                 logger.info(f"Node {current_node.node_id} found integer-feasible solution.")
 
-                current_objective = current_node.lp_objective
+                # --- CORRECTED OBJECTIVE CALCULATION ---
+                clean_integer_solution = {k: round(v) for k, v in current_node.lp_solution.items()}
+                current_objective = sum(clean_integer_solution.get(v.VarName, 0) * v.Obj for v in self.problem.model.getVars())
+                # --- END CORRECTION ---
                 
                 is_new_best = self.incumbent_objective is None or \
                               (self.is_maximization and current_objective > self.incumbent_objective) or \
                               (not self.is_maximization and current_objective < self.incumbent_objective)
 
                 if is_new_best:
-                    self.incumbent_solution = {k: round(v) for k, v in current_node.lp_solution.items()}
+                    self.incumbent_solution = clean_integer_solution
                     self.incumbent_objective = current_objective
                     logger.info(f"New incumbent found! Objective: {self.incumbent_objective:.4f}")
 
@@ -260,38 +287,27 @@ class TreeManager:
 
             logger.info(f"Branching on variable {branch_var_name} with value {branch_val:.4f} from node {current_node.node_id}")
 
-            # Child A: x <= floor(val)
-            child_a_constraints = current_node.local_constraints + [(branch_var_name, '<=', float(branch_val_floor))]
-            child_a = Node(
-                node_id=self.node_counter,
-                parent_id=current_node.node_id,
-                local_constraints=child_a_constraints,
-                lp_objective=None,
-                lp_solution=None,
-                status='PENDING'
-            )
-            self.node_counter += 1
+            # Create and solve children nodes
+            for sense, val in [('<=', float(branch_val_floor)), ('>=', float(branch_val_ceil))]:
+                child_constraints = current_node.local_constraints + [(branch_var_name, sense, val)]
+                child_node = Node(
+                    node_id=self.node_counter,
+                    parent_id=current_node.node_id,
+                    local_constraints=child_constraints,
+                    lp_objective=None,
+                    lp_solution=None,
+                    status='PENDING'
+                )
+                self.node_counter += 1
 
-            # Child B: x >= ceil(val)
-            child_b_constraints = current_node.local_constraints + [(branch_var_name, '>=', float(branch_val_ceil))]
-            child_b = Node(
-                node_id=self.node_counter,
-                parent_id=current_node.node_id,
-                local_constraints=child_b_constraints,
-                lp_objective=None,
-                lp_solution=None,
-                status='PENDING'
-            )
-            self.node_counter += 1
-
-            # Solve children LP relaxations
-            for child_node in [child_a, child_b]:
                 logger.info(f"Solving child node {child_node.node_id} LP relaxation...")
                 child_lp_result = solve_lp_relaxation(self.problem, child_node.local_constraints)
 
                 if child_lp_result['status'] == 'OPTIMAL':
                     child_node.lp_objective = child_lp_result['objective']
                     child_node.lp_solution = child_lp_result['solution']
+                    child_node.vbasis = child_lp_result.get('vbasis')
+                    child_node.cbasis = child_lp_result.get('cbasis')
                     child_node.status = 'SOLVED'
 
                     if self.incumbent_objective is not None:
