@@ -11,48 +11,35 @@ def solve_lp_relaxation(problem: MIPProblem,
                         local_constraints: List[Tuple[str, str, float]], 
                         cuts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
-    Solves the LP relaxation of the MIP problem.
-    It can optionally include a list of generated cuts.
+    Solves the LP relaxation of the MIP problem with its original objective.
     """
     result = {'status': 'UNKNOWN'}
     relaxed_model = None
 
     try:
-        # The .relax() method will create a new model that inherits the parent's environment and parameters.
         relaxed_model = problem.model.relax()
-
-        # Apply local branching constraints
+        
         for var_name, sense, value in local_constraints:
             var = relaxed_model.getVarByName(var_name)
-            if sense == '<=':
-                relaxed_model.addConstr(var <= value)
-            elif sense == '>=':
-                relaxed_model.addConstr(var >= value)
+            if sense == '<=': relaxed_model.addConstr(var <= value)
+            else: relaxed_model.addConstr(var >= value)
         
-        # --- CORRECTED: REBUILD CUT EXPRESSION FROM DATA ---
         if cuts:
             for i, cut in enumerate(cuts):
-                # Expects a dictionary like: {'coeffs': {'x1': 0.5, ...}, 'sense': ..., 'rhs': ...}
                 cut_coeffs_dict = cut['coeffs']
                 cut_rhs = cut['rhs']
                 cut_sense = cut['sense']
                 
-                # Create a new, empty expression within the current model's context
                 new_expr = gp.LinExpr()
                 for var_name, coeff in cut_coeffs_dict.items():
-                    # Get the variable object that belongs to THIS model
                     var = relaxed_model.getVarByName(var_name)
                     if var is not None:
                         new_expr.add(var, coeff)
                 
-                # Add the newly constructed constraint
                 if cut_sense == GRB.GREATER_EQUAL:
-                    relaxed_model.addConstr(new_expr >= cut_rhs, name=f"gomory_{i}")
-                elif cut_sense == GRB.LESS_EQUAL:
-                    relaxed_model.addConstr(new_expr <= cut_rhs, name=f"gomory_{i}")
-                else: # GRB.EQUAL
-                    relaxed_model.addConstr(new_expr == cut_rhs, name=f"gomory_{i}")
-        # --- END CORRECTION ---
+                    relaxed_model.addConstr(new_expr >= cut_rhs, name=f"cut_{i}")
+                else:
+                    relaxed_model.addConstr(new_expr <= cut_rhs, name=f"cut_{i}")
 
         relaxed_model.optimize()
 
@@ -75,4 +62,37 @@ def solve_lp_relaxation(problem: MIPProblem,
         if relaxed_model:
             relaxed_model.dispose()
 
+    return result
+
+# --- NEW FUNCTION FOR FEASIBILITY PUMP ---
+def solve_lp_with_custom_objective(problem: MIPProblem, 
+                                   objective_expr: gp.LinExpr) -> Dict[str, Any]:
+    """
+    Solves an LP with a custom objective function, used by heuristics like Feasibility Pump.
+    """
+    result = {'status': 'UNKNOWN'}
+    model_copy = None
+    try:
+        model_copy = problem.model.relax()
+        
+        # Set the custom objective function
+        model_copy.setObjective(objective_expr, GRB.MINIMIZE)
+        
+        model_copy.optimize()
+
+        if model_copy.Status == GRB.OPTIMAL:
+            result['status'] = 'OPTIMAL'
+            result['objective'] = model_copy.ObjVal
+            result['solution'] = {v.VarName: v.X for v in model_copy.getVars()}
+        else:
+            result['status'] = 'INFEASIBLE' # Or other non-optimal status
+
+    except gp.GurobiError as e:
+        logger.error(f"A Gurobi error occurred during custom objective LP solve: {e}")
+        result['status'] = 'ERROR'
+    
+    finally:
+        if model_copy:
+            model_copy.dispose()
+            
     return result

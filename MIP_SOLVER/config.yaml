@@ -1,14 +1,19 @@
-# Solver settings
+# Solver Configuration File
+
+# Parameters controlling the solver's core logic and termination criteria
 solver_params:
-  time_limit_seconds: 30 # Maximum duration for the solver to run.
-  optimality_gap: 0.0001   # The relative gap to prove optimality.
+  # The relative gap at which the solver will terminate
+  optimality_gap: 0.0001
+  # The maximum time in seconds the solver is allowed to run
+  time_limit_seconds: 300
 
-# Branch and Bound strategy
+# Parameters controlling the strategic decisions of the solver
 strategy:
-  # How to select the next node to explore from the active nodes list.
-  # Options: 'best_bound', 'depth_first', 'best_estimate'
-  node_selection: 'best_bound'
-
-  # How to select the variable to branch on.
+  # Method for selecting the next node to explore from the active nodes list.
+  # Options: 'best_bound', 'depth_first', 'hybrid'
+  node_selection: 'depth_first'
+  
+  # Method for selecting the variable to branch on.
   # Options: 'most_fractional', 'strong_branching'
-  branching_variable: 'strong_branching'
+  branching_variable: 'most_fractional'
+

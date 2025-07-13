@@ -10,6 +10,112 @@ from solver.utilities import setup_logger
 
 logger = setup_logger()
 
+def generate_all_cuts(problem: MIPProblem, lp_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Master function to generate all types of cuts.
+    It calls individual cut generators and aggregates the results.
+    """
+    all_cuts = []
+    
+    gomory_cuts = generate_gomory_cuts(problem, lp_result)
+    all_cuts.extend(gomory_cuts)
+    
+    mir_cuts = generate_mir_cuts(problem, lp_result)
+    all_cuts.extend(mir_cuts)
+    
+    return all_cuts
+
+def generate_mir_cuts(problem: MIPProblem, lp_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Generates Mixed-Integer Rounding (MIR) cuts from single problem constraints.
+    This is a rewritten, more robust version with extensive logging.
+    """
+    logger.info("Attempting to generate MIR cuts...")
+    solution = lp_result.get('solution')
+    if not solution:
+        return []
+
+    generated_cuts = []
+    
+    for constr in problem.model.getConstrs():
+        if constr.Sense != GRB.LESS_EQUAL:
+            continue
+
+        row = problem.model.getRow(constr)
+        b_original = constr.RHS
+        
+        integer_vars_coeffs = {}
+        continuous_vars_coeffs = {}
+
+        for i in range(row.size()):
+            var = row.getVar(i)
+            coeff = row.getCoeff(i)
+            if var.VarName in problem.integer_variable_names:
+                integer_vars_coeffs[var.VarName] = coeff
+            else:
+                continuous_vars_coeffs[var.VarName] = coeff
+
+        if not integer_vars_coeffs:
+            continue
+        
+        logger.debug(f"--- Analyzing constraint '{constr.ConstrName}' for MIR cut ---")
+        
+        b_prime = b_original
+        for var_name, coeff in continuous_vars_coeffs.items():
+            var = problem.model.getVarByName(var_name)
+            if coeff > 0:
+                if var.LB == -GRB.INFINITY:
+                    b_prime = None; break
+                b_prime -= coeff * var.LB
+            else:
+                if var.UB == GRB.INFINITY:
+                    b_prime = None; break
+                b_prime -= coeff * var.UB
+        
+        if b_prime is None:
+            logger.debug(f"Skipping '{constr.ConstrName}': Unbounded continuous variable part.")
+            continue
+
+        b_floor = math.floor(b_prime)
+        f0 = b_prime - b_floor
+        
+        logger.debug(f"Original RHS b={b_original:.4f}, Adjusted RHS b'={b_prime:.4f}, f0={f0:.4f}")
+
+        if f0 < 1e-6 or f0 > (1.0 - 1e-6):
+            logger.debug("Skipping: f0 is negligible.")
+            continue
+
+        cut_lhs_coeffs = {}
+        for var_name, coeff in integer_vars_coeffs.items():
+            fi = coeff - math.floor(coeff)
+            
+            # --- CORRECTED MIR FORMULA ---
+            # This is the standard, correct formula for the MIR coefficient.
+            new_coeff = math.floor(coeff) + max(0, fi - f0) / (1 - f0)
+            # --- END CORRECTION ---
+            
+            cut_lhs_coeffs[var_name] = new_coeff
+            logger.debug(f"  Var '{var_name}': Original coeff={coeff:.4f}, fi={fi:.4f}, New MIR coeff={new_coeff:.4f}")
+
+        current_lhs_val = 0
+        for var_name, coeff in cut_lhs_coeffs.items():
+            current_lhs_val += coeff * solution.get(var_name, 0)
+        
+        logger.debug(f"Violation Check: Cut LHS value = {current_lhs_val:.4f}, Cut RHS = {b_floor:.4f}")
+        
+        if current_lhs_val > b_floor + 1e-6:
+            logger.info(f"SUCCESS: Generated a violated MIR cut from constraint '{constr.ConstrName}'.")
+            generated_cuts.append({
+                'coeffs': cut_lhs_coeffs,
+                'sense': GRB.LESS_EQUAL,
+                'rhs': b_floor
+            })
+            return generated_cuts
+
+    logger.info(f"Finished MIR cut generation attempt. Found {len(generated_cuts)} cuts.")
+    return generated_cuts
+
+
 def generate_gomory_cuts(problem: MIPProblem, lp_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Generates Gomory Mixed-Integer (GMI) cuts from a fractional LP solution.
@@ -53,7 +159,7 @@ def generate_gomory_cuts(problem: MIPProblem, lp_result: Dict[str, Any]) -> List
         basic_indices += [num_vars + i for i, c_name in enumerate(con_names) if lp_result['cbasis'].get(c_name) == GRB.BASIC]
         
         if len(basic_indices) != num_constrs:
-             logger.warning("Basis size mismatch. Skipping cut generation.")
+             logger.warning("Basis size mismatch. Skipping Gomory cut generation.")
              return []
 
         A_full_sparse = csr_matrix(np.hstack([A_sparse.toarray(), np.identity(num_constrs)]))
@@ -82,10 +188,7 @@ def generate_gomory_cuts(problem: MIPProblem, lp_result: Dict[str, Any]) -> List
             a_bar_j = tableau_coeffs[j]
             fj = a_bar_j - math.floor(a_bar_j)
             
-            # --- THIS IS THE CORRECTED LINE ---
-            # Gurobi uses integer codes for basis status. -2 indicates non-basic at upper bound.
             is_at_upper = lp_result['vbasis'].get(v_name) == -2
-            # --- END CORRECTION ---
             
             if fj <= f0:
                 if is_at_upper:
@@ -110,7 +213,7 @@ def generate_gomory_cuts(problem: MIPProblem, lp_result: Dict[str, Any]) -> List
                  'rhs': cut_rhs}]
 
     except Exception as e:
-        logger.error(f"An unexpected error occurred during cut generation: {e}")
+        logger.error(f"An unexpected error occurred during Gomory cut generation: {e}")
         return []
     finally:
         if temp_model:

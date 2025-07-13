@@ -13,7 +13,7 @@ def setup_logger():
         return logger
     # ----------------------
 
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     
     # Create a handler
     ch = logging.StreamHandler()
