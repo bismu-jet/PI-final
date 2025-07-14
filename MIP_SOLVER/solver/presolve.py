@@ -1,4 +1,5 @@
 import gurobipy as gp
+import math
 from gurobipy import GRB
 from typing import List, Dict
 from solver.problem import MIPProblem
@@ -18,6 +19,7 @@ def fix_variables_from_singletons(problem: MIPProblem):
     
     constrs_to_remove_indices = []
     
+    # We iterate over a copy of the constraints list as we might modify the model
     for i, constr in enumerate(model.getConstrs()):
         if model.getRow(constr).size() != 1:
             continue
@@ -192,49 +194,147 @@ def tighten_coefficients(problem: MIPProblem):
         model.update()
 
 
+def propagate_bounds(problem: MIPProblem) -> int:
+    """
+    --- CORRECTED VERSION with ENHANCED LOGGING ---
+    Iteratively tightens the bounds of variables based on the constraints.
+
+    Returns:
+        The number of tightenings, or -1 if infeasibility is detected.
+    """
+    logger.info("Starting presolve technique: Bound Propagation...")
+    model, tightenings, TOLERANCE = problem.model, 0, 1e-9
+    model.update()
+
+    for constr in model.getConstrs():
+        row = model.getRow(constr)
+        if row.size() < 2: continue
+        
+        rhs, sense = constr.RHS, constr.Sense
+        
+        for i in range(row.size()):
+            var_i = row.getVar(i)
+            if var_i.LB > var_i.UB - TOLERANCE: continue
+
+            coeff_i = row.getCoeff(i)
+            if abs(coeff_i) < TOLERANCE: continue
+
+            activity_rest_min, activity_rest_max = 0.0, 0.0
+            for j in range(row.size()):
+                if i == j: continue
+                var_j, coeff_j = row.getVar(j), row.getCoeff(j)
+                
+                if (coeff_j > 0 and var_j.LB == -GRB.INFINITY) or (coeff_j < 0 and var_j.UB == GRB.INFINITY):
+                    activity_rest_min = -GRB.INFINITY
+                if (coeff_j > 0 and var_j.UB == GRB.INFINITY) or (coeff_j < 0 and var_j.LB == -GRB.INFINITY):
+                    activity_rest_max = GRB.INFINITY
+
+                if activity_rest_min != -GRB.INFINITY:
+                    activity_rest_min += coeff_j * var_j.LB if coeff_j > 0 else coeff_j * var_j.UB
+                if activity_rest_max != GRB.INFINITY:
+                    activity_rest_max += coeff_j * var_j.UB if coeff_j > 0 else coeff_j * var_j.LB
+            
+            old_lb, old_ub = var_i.LB, var_i.UB
+            
+            # --- TIGHTEN UPPER BOUND ---
+            new_ub_val = old_ub
+            if coeff_i > 0 and sense in [GRB.LESS_EQUAL, GRB.EQUAL] and activity_rest_min != -GRB.INFINITY:
+                new_ub_val = (rhs - activity_rest_min) / coeff_i
+            elif coeff_i < 0 and sense in [GRB.GREATER_EQUAL, GRB.EQUAL] and activity_rest_max != GRB.INFINITY:
+                new_ub_val = (rhs - activity_rest_max) / coeff_i
+            
+            if abs(new_ub_val) < GRB.INFINITY and new_ub_val < old_ub - TOLERANCE:
+                final_ub = math.floor(new_ub_val + TOLERANCE) if var_i.VType in [GRB.BINARY, GRB.INTEGER] else new_ub_val
+                if final_ub < var_i.UB:
+                    logger.debug(f"  [Bound Prop] UB of '{var_i.VarName}' tightened from {var_i.UB:.4f} to {final_ub:.4f} by constr '{constr.ConstrName}'")
+                    var_i.UB = final_ub
+                    tightenings += 1
+
+            # --- TIGHTEN LOWER BOUND ---
+            new_lb_val = old_lb
+            if coeff_i > 0 and sense in [GRB.GREATER_EQUAL, GRB.EQUAL] and activity_rest_max != -GRB.INFINITY:
+                new_lb_val = (rhs - activity_rest_max) / coeff_i
+            elif coeff_i < 0 and sense in [GRB.LESS_EQUAL, GRB.EQUAL] and activity_rest_min != -GRB.INFINITY:
+                new_lb_val = (rhs - activity_rest_min) / coeff_i
+            
+            if abs(new_lb_val) < GRB.INFINITY and new_lb_val > old_lb + TOLERANCE:
+                final_lb = math.ceil(new_lb_val - TOLERANCE) if var_i.VType in [GRB.BINARY, GRB.INTEGER] else new_lb_val
+                if final_lb > var_i.LB:
+                    logger.debug(f"  [Bound Prop] LB of '{var_i.VarName}' tightened from {var_i.LB:.4f} to {final_lb:.4f} by constr '{constr.ConstrName}'")
+                    var_i.LB = final_lb
+                    tightenings += 1
+
+            # --- FINAL SAFETY CHECK ---
+            if var_i.LB > var_i.UB + TOLERANCE:
+                logger.warning(f"Presolve detected infeasibility: LB ({var_i.LB:.4f}) > UB ({var_i.UB:.4f}) for var '{var_i.VarName}' in constr '{constr.ConstrName}'")
+                return -1
+
+    if tightenings > 0:
+        logger.info(f"Bound propagation pass finished. Total tightenings: {tightenings}.")
+        model.update()
+    else:
+        logger.info("Bound propagation pass finished. No new tightenings found.")
+        
+    return tightenings
+
+
 def probe_binary_variables(problem: MIPProblem):
     """
-    --- NEW: Performs probing on binary variables to find fixings. ---
+    --- REVISED: Performs probing on binary variables more efficiently and with detailed logging. ---
     
     For each binary variable, it checks if fixing it to 0 or 1 leads to
     an infeasible subproblem, allowing the variable to be fixed to the other value.
+    This version uses a single model copy for better performance.
     """
     logger.info("Starting presolve technique: Probing...")
     model = problem.model
     model.update()
 
-    binary_vars = [v for v in model.getVars() if v.VType == GRB.BINARY]
-    
+    binary_vars = [v for v in model.getVars() if v.VType == GRB.BINARY and v.LB != v.UB]
+    if not binary_vars:
+        logger.info("Probing: No unfixed binary variables to probe.")
+        return
+
     vars_to_fix_to_0 = []
     vars_to_fix_to_1 = []
 
-    for var in binary_vars:
-        logger.info("Probing...")
-        # Skip variables that are already fixed
-        if var.LB == var.UB:
-            continue
-            
-        # --- Probe by fixing to 1 ---
-        probe_model_1 = model.copy()
-        probe_model_1.setParam('OutputFlag', 0)
-        probe_model_1.setParam('TimeLimit', 1) # Short time limit for presolve
-        p_var_1 = probe_model_1.getVarByName(var.VarName)
-        p_var_1.LB = 1.0
-        probe_model_1.optimize()
-        if probe_model_1.Status == GRB.INFEASIBLE:
-            vars_to_fix_to_0.append(var.VarName)
-        probe_model_1.dispose()
+    probe_model = None
+    try:
+        probe_model = model.copy()
+        probe_model.setParam('OutputFlag', 0)
+        probe_model.setParam('TimeLimit', 1) 
+        probe_model.setParam('Method', 0) 
 
-        # --- Probe by fixing to 0 ---
-        probe_model_0 = model.copy()
-        probe_model_0.setParam('OutputFlag', 0)
-        probe_model_0.setParam('TimeLimit', 1)
-        p_var_0 = probe_model_0.getVarByName(var.VarName)
-        p_var_0.UB = 0.0
-        probe_model_0.optimize()
-        if probe_model_0.Status == GRB.INFEASIBLE:
-            vars_to_fix_to_1.append(var.VarName)
-        probe_model_0.dispose()
+        total_probes = len(binary_vars)
+        logger.info(f"Probing {total_probes} binary variables...")
+
+        for i, var in enumerate(binary_vars):
+            p_var = probe_model.getVarByName(var.VarName)
+            logger.debug(f"Probing [{i+1}/{total_probes}]: '{var.VarName}'")
+            
+            # --- Probe by fixing to 1 (to see if we can fix to 0) ---
+            original_lb = p_var.LB
+            p_var.LB = 1.0
+            probe_model.optimize()
+            if probe_model.Status == GRB.INFEASIBLE:
+                vars_to_fix_to_0.append(var.VarName)
+                logger.debug(f"  -> Probe result for '{var.VarName}'=1 is INFEASIBLE. Can fix to 0.")
+            p_var.LB = original_lb # Restore bound
+
+            # --- Probe by fixing to 0 (to see if we can fix to 1) ---
+            # We only do this if the first probe didn't already find a fixing
+            if var.VarName not in vars_to_fix_to_0:
+                original_ub = p_var.UB
+                p_var.UB = 0.0
+                probe_model.optimize()
+                if probe_model.Status == GRB.INFEASIBLE:
+                    vars_to_fix_to_1.append(var.VarName)
+                    logger.debug(f"  -> Probe result for '{var.VarName}'=0 is INFEASIBLE. Can fix to 1.")
+                p_var.UB = original_ub # Restore bound
+            
+    finally:
+        if probe_model:
+            probe_model.dispose()
 
     # Apply the deductions to the original model
     if vars_to_fix_to_0:
@@ -247,19 +347,43 @@ def probe_binary_variables(problem: MIPProblem):
         for var_name in vars_to_fix_to_1:
             model.getVarByName(var_name).LB = 1.0
     
-    if vars_to_fix_to_0 or vars_to_fix_to_1:
+    total_fixed = len(vars_to_fix_to_0) + len(vars_to_fix_to_1)
+    if total_fixed > 0:
+        logger.info(f"Probing Summary: Fixed a total of {total_fixed} variables.")
         model.update()
     else:
         logger.info("Probing did not find any variable fixings.")
 
-
 def presolve(problem: MIPProblem):
     """
-    The main presolve routine that calls all individual presolve techniques.
+    --- REVISED: The main presolve routine. --- 
+    
+    Calls presolve techniques iteratively and halts if infeasibility is proven.
     """
-    logger.info("--- Starting Presolve Pass ---")
-    eliminate_redundant_constraints(problem)
-    fix_variables_from_singletons(problem)
-    tighten_coefficients(problem)
+    logger.info("--- Starting Presolve Phase ---")
+    
+    max_passes = 4
+    for i in range(max_passes):
+        logger.info(f"Presolve Iteration {i+1}/{max_passes}...")
+        
+        fix_variables_from_singletons(problem)
+        eliminate_redundant_constraints(problem)
+        tighten_coefficients(problem)
+        
+        changes_found = propagate_bounds(problem)
+        
+        # --- Handle Infeasibility Signal ---
+        if changes_found == -1:
+            logger.error("Model has been proven infeasible during bound propagation. Halting solver.")
+            # Optionally set a status on the problem object to be used by the caller
+            # problem.model.setAttr("Status", GRB.INFEASIBLE) 
+            return # Exit presolve entirely
+
+        if changes_found == 0:
+            logger.info("Presolve pass completed with no new bound changes. Exiting loop.")
+            break
+            
+    # Probing should only run if the model is still potentially feasible
     probe_binary_variables(problem)
-    logger.info("--- Presolve Pass Finished ---")
+    
+    logger.info("--- Presolve Phase Finished ---")

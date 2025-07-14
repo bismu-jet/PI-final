@@ -17,7 +17,7 @@ def setup_logger():
     
     # Create a handler
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.DEBUG)
     
     # Create a formatter and add it to the handler
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
