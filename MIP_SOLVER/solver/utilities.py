@@ -5,13 +5,9 @@ def setup_logger():
     Sets up a logger that avoids adding duplicate handlers.
     """
     logger = logging.getLogger("MIPSolver")
-    
-    # --- THIS IS THE FIX ---
-    # Check if the logger already has handlers configured.
-    # If it does, it means we've already set it up, so we just return it.
+
     if logger.hasHandlers():
         return logger
-    # ----------------------
 
     logger.setLevel(logging.DEBUG)
     

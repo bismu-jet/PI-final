@@ -1,22 +1,9 @@
-# Solver Configuration File
-
-# Parameters controlling the solver's core logic and termination criteria
 solver_params:
-  # The relative gap at which the solver will terminate
   optimality_gap: 0.0001
-  # The maximum time in seconds the solver is allowed to run
   time_limit_seconds: 900
+  heuristic_frequency: 20   
+  rins_time_limit: 5.0     
 
-# Parameters controlling the strategic decisions of the solver
 strategy:
-  # Method for selecting the next node to explore from the active nodes list.
-  # Options: 'best_bound', 'depth_first', 'hybrid'
   node_selection: 'hybrid'
-  
-  # Method for selecting the variable to branch on.
-  # Options: 'most_fractional', 'strong_branching'
   branching_variable: 'pseudocost'
-
-  # --- Recommended New Parameters for Heuristics ---
-  heuristic_frequency: 20  # Runs periodic heuristics every 20 nodes.
-  rins_time_limit: 5.0     # Sets a 5-second time limit for the RINS sub-MIP.
