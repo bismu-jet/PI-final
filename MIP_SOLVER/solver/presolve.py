@@ -6,6 +6,7 @@ from solver.utilities import setup_logger
 
 logger = setup_logger()
 
+
 def fix_variables_from_singletons(problem: MIPProblem):
     """
     Finds constraints with only one variable (singletons) and uses them to
@@ -13,12 +14,11 @@ def fix_variables_from_singletons(problem: MIPProblem):
     """
     logger.info("Starting presolve technique: Variable Fixing from Singleton Constraints...")
     model = problem.model
-    model.update() # Ensure model is up-to-date before we start
+    model.update() 
     
     constrs_to_remove_indices = []
     
     for i, constr in enumerate(model.getConstrs()):
-        # A constraint is a singleton if it involves only one variable
         if model.getRow(constr).size() != 1:
             continue
 
@@ -28,47 +28,40 @@ def fix_variables_from_singletons(problem: MIPProblem):
         rhs = constr.RHS
         sense = constr.Sense
         
-        if abs(coeff) < 1e-9: continue # Should not happen, but a safe check
+        if abs(coeff) < 1e-9: continue
 
-        # This constraint's information will be absorbed into the variable's bounds,
-        # so we can mark it for removal.
         constrs_to_remove_indices.append(i)
 
         implied_val = rhs / coeff
         
         try:
             if sense == GRB.LESS_EQUAL:
-                if coeff > 0: # e.g., 2x <= 10  =>  x <= 5
+                if coeff > 0:
                     if implied_val < var.UB:
                         var.UB = implied_val
                         logger.info(f"Constraint '{constr.ConstrName}' tightened UB of '{var.VarName}' to {implied_val}")
-                else: # e.g., -2x <= 10  =>  x >= -5
+                else: 
                     if implied_val > var.LB:
                         var.LB = implied_val
                         logger.info(f"Constraint '{constr.ConstrName}' tightened LB of '{var.VarName}' to {implied_val}")
             
             elif sense == GRB.GREATER_EQUAL:
-                if coeff > 0: # e.g., 2x >= 10  =>  x >= 5
+                if coeff > 0:
                     if implied_val > var.LB:
                         var.LB = implied_val
                         logger.info(f"Constraint '{constr.ConstrName}' tightened LB of '{var.VarName}' to {implied_val}")
-                else: # e.g., -2x >= 10  =>  x <= -5
+                else:
                     if implied_val < var.UB:
                         var.UB = implied_val
                         logger.info(f"Constraint '{constr.ConstrName}' tightened UB of '{var.VarName}' to {implied_val}")
 
-            elif sense == GRB.EQUAL: # e.g., 2x == 10  =>  x == 5
-                # This constraint fixes the variable. We set both bounds to the same value.
+            elif sense == GRB.EQUAL:
                 var.LB = implied_val
                 var.UB = implied_val
                 logger.info(f"Constraint '{constr.ConstrName}' fixed '{var.VarName}' to {implied_val}")
         
         except gp.GurobiError as e:
-            # This error occurs if we try to set an invalid bound (e.g., UB < LB),
-            # which proves the model is infeasible.
             logger.warning(f"Infeasibility detected by presolve while processing '{constr.ConstrName}'. Error: {e}")
-            # For now, we will stop presolving and let the main solver find the infeasibility.
-            # A more advanced implementation would set a status flag on the problem object.
             return
 
     if constrs_to_remove_indices:
@@ -76,22 +69,18 @@ def fix_variables_from_singletons(problem: MIPProblem):
         problem.remove_constraints_by_index(constrs_to_remove_indices)
         model.update()
 
+
 def eliminate_redundant_constraints(problem: MIPProblem):
     """
     Identifies and removes redundant (dominated) constraints from the MIP problem.
-    A constraint is dominated if another constraint with the same variables and
-    coefficients is stricter.
     """
     logger.info("Starting presolve technique: Redundant Constraint Elimination...")
     model = problem.model
     constraints = model.getConstrs()
     
-    # Group constraints by their structure (ignoring RHS and sense)
     constr_map: Dict[tuple, list] = {}
     for i, constr in enumerate(constraints):
         row = model.getRow(constr)
-        # Create a canonical representation of the constraint's LHS
-        # This tuple will be the key in our map
         vars_and_coeffs = tuple(sorted((row.getVar(j).VarName, row.getCoeff(j)) for j in range(row.size())))
         
         if vars_and_coeffs not in constr_map:
@@ -99,19 +88,16 @@ def eliminate_redundant_constraints(problem: MIPProblem):
         constr_map[vars_and_coeffs].append({'index': i, 'sense': constr.Sense, 'rhs': constr.RHS})
 
     constrs_to_remove_indices = []
-    # Identify dominated constraints within each group
     for lhs, group in constr_map.items():
         if len(group) < 2:
             continue
 
-        # Sub-group by sense (<= or >=)
         sense_groups: Dict[str, list] = {}
         for item in group:
             if item['sense'] not in sense_groups:
                 sense_groups[item['sense']] = []
             sense_groups[item['sense']].append(item)
 
-        # For '<=' constraints, keep only the one with the minimum RHS
         if GRB.LESS_EQUAL in sense_groups and len(sense_groups[GRB.LESS_EQUAL]) > 1:
             le_group = sense_groups[GRB.LESS_EQUAL]
             min_rhs_item = min(le_group, key=lambda x: x['rhs'])
@@ -119,7 +105,6 @@ def eliminate_redundant_constraints(problem: MIPProblem):
                 if item['index'] != min_rhs_item['index']:
                     constrs_to_remove_indices.append(item['index'])
 
-        # For '>=' constraints, keep only the one with the maximum RHS
         if GRB.GREATER_EQUAL in sense_groups and len(sense_groups[GRB.GREATER_EQUAL]) > 1:
             ge_group = sense_groups[GRB.GREATER_EQUAL]
             max_rhs_item = max(ge_group, key=lambda x: x['rhs'])
@@ -134,11 +119,10 @@ def eliminate_redundant_constraints(problem: MIPProblem):
     else:
         logger.info("No redundant constraints found.")
 
+
 def tighten_coefficients(problem: MIPProblem):
     """
-    Performs coefficient tightening on constraints. This version includes safety
-    checks to ensure it does not create invalid coefficients when variables
-    have infinite bounds.
+    Performs coefficient tightening on constraints.
     """
     logger.info("Starting presolve technique: Coefficient Tightening...")
     model = problem.model
@@ -169,19 +153,16 @@ def tighten_coefficients(problem: MIPProblem):
                 continue
 
             min_activity_rest = 0
-            can_tighten = True # Assume we can tighten unless we find an unbounded variable
+            can_tighten = True
             for j in range(row.size()):
                 if j == k: continue
                 var_j = row.getVar(j)
                 coeff_j = row.getCoeff(j)
                 
-                # --- THIS IS THE FIX ---
-                # Check for infinite bounds before calculating activity.
-                # If a bound is infinite, we cannot safely tighten and must skip.
                 if (coeff_j > 0 and var_j.LB == -GRB.INFINITY) or \
                    (coeff_j < 0 and var_j.UB == GRB.INFINITY):
                     can_tighten = False
-                    break # Exit the inner loop, we cannot tighten this var_k
+                    break 
                 
                 if coeff_j > 0:
                     min_activity_rest += coeff_j * var_j.LB
@@ -189,7 +170,7 @@ def tighten_coefficients(problem: MIPProblem):
                     min_activity_rest += coeff_j * var_j.UB
             
             if not can_tighten:
-                continue # Move to the next variable in the constraint
+                continue
 
             new_coeff_k = constr.RHS - min_activity_rest
             if new_coeff_k < coeff_k:
@@ -209,17 +190,76 @@ def tighten_coefficients(problem: MIPProblem):
         for c in constraints_to_add:
             model.addConstr(c['expr'] <= c['rhs'], name=c['name'])
         model.update()
-#NEXT STEPS: PROBING HERE
+
+
+def probe_binary_variables(problem: MIPProblem):
+    """
+    --- NEW: Performs probing on binary variables to find fixings. ---
+    
+    For each binary variable, it checks if fixing it to 0 or 1 leads to
+    an infeasible subproblem, allowing the variable to be fixed to the other value.
+    """
+    logger.info("Starting presolve technique: Probing...")
+    model = problem.model
+    model.update()
+
+    binary_vars = [v for v in model.getVars() if v.VType == GRB.BINARY]
+    
+    vars_to_fix_to_0 = []
+    vars_to_fix_to_1 = []
+
+    for var in binary_vars:
+        logger.info("Probing...")
+        # Skip variables that are already fixed
+        if var.LB == var.UB:
+            continue
+            
+        # --- Probe by fixing to 1 ---
+        probe_model_1 = model.copy()
+        probe_model_1.setParam('OutputFlag', 0)
+        probe_model_1.setParam('TimeLimit', 1) # Short time limit for presolve
+        p_var_1 = probe_model_1.getVarByName(var.VarName)
+        p_var_1.LB = 1.0
+        probe_model_1.optimize()
+        if probe_model_1.Status == GRB.INFEASIBLE:
+            vars_to_fix_to_0.append(var.VarName)
+        probe_model_1.dispose()
+
+        # --- Probe by fixing to 0 ---
+        probe_model_0 = model.copy()
+        probe_model_0.setParam('OutputFlag', 0)
+        probe_model_0.setParam('TimeLimit', 1)
+        p_var_0 = probe_model_0.getVarByName(var.VarName)
+        p_var_0.UB = 0.0
+        probe_model_0.optimize()
+        if probe_model_0.Status == GRB.INFEASIBLE:
+            vars_to_fix_to_1.append(var.VarName)
+        probe_model_0.dispose()
+
+    # Apply the deductions to the original model
+    if vars_to_fix_to_0:
+        logger.info(f"Probing fixed {len(vars_to_fix_to_0)} variables to 0.")
+        for var_name in vars_to_fix_to_0:
+            model.getVarByName(var_name).UB = 0.0
+            
+    if vars_to_fix_to_1:
+        logger.info(f"Probing fixed {len(vars_to_fix_to_1)} variables to 1.")
+        for var_name in vars_to_fix_to_1:
+            model.getVarByName(var_name).LB = 1.0
+    
+    if vars_to_fix_to_0 or vars_to_fix_to_1:
+        model.update()
+    else:
+        logger.info("Probing did not find any variable fixings.")
+
 
 def presolve(problem: MIPProblem):
     """
     The main presolve routine that calls all individual presolve techniques.
-    
-    Args:
-        problem (MIPProblem): The MIPProblem to be presolved.
     """
     logger.info("--- Starting Presolve Pass ---")
     eliminate_redundant_constraints(problem)
     fix_variables_from_singletons(problem)
     tighten_coefficients(problem)
+    probe_binary_variables(problem)
     logger.info("--- Presolve Pass Finished ---")

@@ -4,10 +4,54 @@ import math
 from typing import List, Dict, Optional, Tuple, Any
 
 from solver.problem import MIPProblem
-from solver.gurobi_interface import solve_lp_relaxation, solve_lp_with_custom_objective
+from solver.gurobi_interface import solve_lp_relaxation, solve_lp_with_custom_objective, solve_sub_mip
 from solver.utilities import setup_logger
 
 logger = setup_logger()
+
+
+def _rins_heuristic(problem: MIPProblem,
+                    incumbent_solution: Dict[str, float],
+                    current_lp_solution: Dict[str, float],
+                    time_limit: float = 5.0) -> Optional[Dict[str, Any]]:
+    """
+    --- NEW: Relaxation Induced Neighborhood Search (RINS) Heuristic ---
+
+    Explores the neighborhood of the incumbent by fixing integer variables
+    that have the same value in both the incumbent and the current LP relaxation.
+    A sub-MIP is then solved on the remaining variables.
+    """
+    logger.info("Attempting to find solution with RINS Heuristic...")
+
+    vars_to_fix = {}
+    # Identify integer variables to fix
+    for var_name in problem.integer_variable_names:
+        incumbent_val = incumbent_solution.get(var_name)
+        lp_val = current_lp_solution.get(var_name)
+
+        # We need both values to make a comparison
+        if incumbent_val is None or lp_val is None:
+            continue
+
+        # If the rounded incumbent value matches the rounded LP value, fix it.
+        if abs(round(incumbent_val) - round(lp_val)) < 1e-6:
+            vars_to_fix[var_name] = round(incumbent_val)
+
+    if len(vars_to_fix) == len(problem.integer_variable_names):
+        logger.debug("RINS skipped: All integer variables are already fixed to the same values.")
+        return None
+
+    logger.info(f"RINS: Fixing {len(vars_to_fix)} integer variables and solving sub-MIP.")
+
+    sub_mip_result = solve_sub_mip(problem, vars_to_fix, time_limit)
+
+    if sub_mip_result['status'] == 'FEASIBLE':
+        logger.info(f"RINS found a feasible solution with objective: {sub_mip_result['objective']:.4f}")
+        return sub_mip_result
+    else:
+        logger.info("RINS did not find a new solution.")
+        return None
+
 
 def _diving_heuristic(problem: MIPProblem,
                       initial_lp_solution: Dict[str, float],
@@ -54,6 +98,7 @@ def _diving_heuristic(problem: MIPProblem,
     logger.warning("Diving heuristic exceeded max iterations.")
     return None
 
+
 def _feasibility_pump(problem: MIPProblem,
                       initial_lp_solution: Dict[str, float]) -> Optional[Dict[str, float]]:
     """
@@ -70,9 +115,9 @@ def _feasibility_pump(problem: MIPProblem,
 
         objective_coeffs = {}
         for var_name in problem.integer_variable_names:
-            if x_int.get(var_name, 0) > 0.5: # If rounded value is 1
+            if x_int.get(var_name, 0) > 0.5:
                 objective_coeffs[var_name] = -1.0
-            else: # If rounded value is 0
+            else:
                 objective_coeffs[var_name] = 1.0
 
         lp_result = solve_lp_with_custom_objective(problem, objective_coeffs)
@@ -98,6 +143,7 @@ def _feasibility_pump(problem: MIPProblem,
     logger.warning("Feasibility Pump exceeded max iterations.")
     return None
 
+
 def _coefficient_diving(problem: MIPProblem,
                         initial_lp_solution: Dict[str, float],
                         initial_constraints: List[Tuple[str, str, float]]) -> Optional[Dict[str, float]]:
@@ -108,7 +154,6 @@ def _coefficient_diving(problem: MIPProblem,
     """
     logger.info("Attempting to find solution with Coefficient Diving Heuristic...")
 
-    # Pre-calculate lock counts for all variables
     lock_counts = {v.VarName: 0 for v in problem.model.getVars()}
     for constr in problem.model.getConstrs():
         for i in range(problem.model.getRow(constr).size()):
@@ -128,17 +173,16 @@ def _coefficient_diving(problem: MIPProblem,
             logger.info(f"Coefficient Diving successful after {dive_iteration} dives.")
             return {v_name: round(v_val) for v_name, v_val in current_solution.items()}
 
-        # Select the fractional variable with the highest lock count
         best_var_to_fix = max(fractional_vars, key=lambda vn: lock_counts.get(vn, 0))
-        
+
         val_to_fix = current_solution[best_var_to_fix]
         rounded_val = round(val_to_fix)
-        
+
         logger.debug(f"Coef. Dive {dive_iteration}: Fixing '{best_var_to_fix}' (lock count: {lock_counts.get(best_var_to_fix, 0)}) to {rounded_val}")
         current_constraints.append((best_var_to_fix, '==', float(rounded_val)))
-        
+
         lp_result = solve_lp_relaxation(problem, current_constraints)
-        
+
         if lp_result['status'] == 'OPTIMAL':
             current_solution = lp_result['solution']
         else:
@@ -166,29 +210,34 @@ def find_initial_solution(problem: MIPProblem,
 
     return None
 
-def run_periodic_heuristics(problem: MIPProblem,
-                           lp_solution: Dict[str, float],
-                           local_constraints: List[Tuple[str, str, float]]) -> Optional[Dict[str, float]]:
-    """
-    --- NEW: Master function for periodic heuristics ---
-    Runs more expensive heuristics that are not run at the root node.
-    """
-    logger.info("--- Running Periodic Heuristics ---")
-    solution = _coefficient_diving(problem, lp_solution, local_constraints)
-    if solution:
-        # As before, we must verify the heuristic solution can be extended
-        # to a fully feasible solution for all variables.
-        fixed_vars_constraints = []
-        for var_name, value in solution.items():
-            if var_name in problem.integer_variable_names:
-                 fixed_vars_constraints.append((var_name, '==', float(round(value))))
-        
-        completion_lp_result = solve_lp_relaxation(problem, fixed_vars_constraints)
 
-        if completion_lp_result['status'] == 'OPTIMAL':
-            logger.info("Coefficient Diving found and verified a new feasible solution.")
-            return completion_lp_result['solution']
-        else:
-            logger.warning("Coefficient Diving solution was not extendable to a feasible solution.")
+def run_periodic_heuristics(problem: MIPProblem,
+                           current_node_solution: Dict[str, float],
+                           incumbent_solution: Optional[Dict[str, float]],
+                           config: Dict) -> Optional[Dict[str, Any]]:
+    """
+    --- REVISED: Master function for periodic and improvement heuristics. ---
+
+    This function now orchestrates multiple heuristics, including RINS, that
+    are called periodically during the main B&B search.
+    """
+    logger.info("--- Running Periodic/Improvement Heuristics ---")
+
+    # --- RINS HEURISTIC ---
+    # RINS requires an incumbent solution to work.
+    if incumbent_solution:
+        rins_solution = _rins_heuristic(
+            problem=problem,
+            incumbent_solution=incumbent_solution,
+            current_lp_solution=current_node_solution,
+            time_limit=config.get('rins_time_limit', 5.0)
+        )
+        # The result from RINS is already a full solution dictionary with an objective.
+        if rins_solution:
+            return rins_solution
+
+    # --- OTHER HEURISTICS CAN BE CALLED HERE ---
+    # For example, Coefficient Diving could also be considered an improvement heuristic.
+    # We will keep it separate for now to demonstrate the RINS flow clearly.
 
     return None

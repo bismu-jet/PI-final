@@ -1,6 +1,7 @@
 import time
 import yaml
 import math
+import heapq  # --- 1. IMPORT HEAPQ ---
 import gurobipy as gp
 from gurobipy import GRB
 from typing import List, Dict, Optional, Tuple, Any
@@ -9,7 +10,7 @@ from solver.cuts import generate_all_cuts
 from solver.problem import MIPProblem
 from solver.node import Node
 from solver.gurobi_interface import solve_lp_relaxation
-from solver.heuristics import find_initial_solution
+from solver.heuristics import find_initial_solution, run_periodic_heuristics
 from solver.utilities import setup_logger
 from solver.presolve import presolve
 
@@ -45,11 +46,46 @@ class TreeManager:
 
         self.cut_pool: List[Dict[str, Any]] = []
         
-        self.switched_to_best_bound = False
-
         self.pseudocosts = {}
 
         logger.info(f"Initialized TreeManager with problem: {problem_path} and config: {config_path}")
+
+    def _update_incumbent(self, new_solution: Dict, new_objective: float) -> bool:
+        """
+        Checks if a new solution is better than the current incumbent and updates it.
+        """
+        is_new_best = self.incumbent_objective is None or \
+                      (self.is_maximization and new_objective > self.incumbent_objective) or \
+                      (not self.is_maximization and new_objective < self.incumbent_objective)
+        
+        if is_new_best:
+            # --- 4. IMPLEMENT THE SWITCH LOGIC ---
+            # If this is the first time we're finding a solution, switch strategy.
+            if self.incumbent_objective is None:
+                Node.switch_to_bb = True
+                Node.is_maximization = self.is_maximization
+                logger.info("--- First incumbent found. Switching node selection strategy to Best-Bound. ---")
+                # Rebuild the heap with the new comparison logic
+                heapq.heapify(self.active_nodes)
+
+            self.incumbent_solution = new_solution
+            self.incumbent_objective = new_objective
+            logger.info(f"New incumbent found! Objective: {self.incumbent_objective:.4f}")
+            self.active_nodes = [
+                n for n in self.active_nodes if self._is_promising(n)
+            ]
+            heapq.heapify(self.active_nodes)
+            return True
+        return False
+
+    def _is_promising(self, node: Node) -> bool:
+        """Checks if a node can be pruned based on the current incumbent."""
+        if self.incumbent_objective is None:
+            return True
+        if self.is_maximization:
+            return node.lp_objective > self.incumbent_objective
+        else:
+            return node.lp_objective < self.incumbent_objective
 
     def _is_integer_feasible(self, solution: Dict[str, float], tolerance: float = 1e-6) -> bool:
         for var_name in self.problem.integer_variable_names:
@@ -80,13 +116,11 @@ class TreeManager:
             pc_down_info = self.pseudocosts.get(var_name, {}).get('down', {})
             pc_up_info = self.pseudocosts.get(var_name, {}).get('up', {})
 
-            # --- FIX: Use .get() with a default value to prevent KeyError ---
             pc_down_count = pc_down_info.get('count', 0)
             pc_up_count = pc_up_info.get('count', 0)
 
             pc_down = (pc_down_info.get('sum_degrad', 0.0) / pc_down_count) if pc_down_count > 0 else 1.0
             pc_up = (pc_up_info.get('sum_degrad', 0.0) / pc_up_count) if pc_up_count > 0 else 1.0
-            # --- END FIX ---
             
             score = (1 - frac_part) * pc_down + frac_part * pc_up
             
@@ -154,7 +188,7 @@ class TreeManager:
             root_node.cbasis = lp_result.get('cbasis')
             root_node.status = 'SOLVED'
             self.global_best_bound = root_node.lp_objective
-            self.active_nodes.append(root_node)
+            heapq.heappush(self.active_nodes, root_node)
             logger.info(f"Root node {root_node.node_id} solved. LP Objective: {root_node.lp_objective:.4f}")
 
             candidate_integer_solution = find_initial_solution(self.problem, root_node.lp_solution, root_node.local_constraints)
@@ -162,9 +196,7 @@ class TreeManager:
                 fixed_vars_constraints = [(v, '==', float(round(val))) for v, val in candidate_integer_solution.items() if v in self.problem.integer_variable_names]
                 completion_lp_result = solve_lp_relaxation(self.problem, fixed_vars_constraints)
                 if completion_lp_result['status'] == 'OPTIMAL':
-                    self.incumbent_solution = completion_lp_result['solution']
-                    self.incumbent_objective = completion_lp_result['objective']
-                    logger.info(f"Found and verified initial incumbent solution via heuristic. Objective: {self.incumbent_objective:.4f}")
+                    self._update_incumbent(completion_lp_result['solution'], completion_lp_result['objective'])
                 else:
                     logger.warning("Heuristic solution was not extendable to a feasible solution.")
         else:
@@ -177,10 +209,11 @@ class TreeManager:
                 logger.info(f"Time limit of {self.time_limit_seconds} seconds reached. Terminating solver.")
                 break
             
-            if self.is_maximization:
-                self.global_best_bound = max((node.lp_objective for node in self.active_nodes if node.lp_objective is not None), default=-math.inf)
-            else:
+            if not Node.switch_to_bb:
                 self.global_best_bound = min((node.lp_objective for node in self.active_nodes if node.lp_objective is not None), default=math.inf)
+            else:
+                 self.global_best_bound = self.active_nodes[0].lp_objective if self.active_nodes else (math.inf if not self.is_maximization else -math.inf)
+
             
             logger.info(f"--- Nodes: {len(self.active_nodes)}, Global Best Bound: {self.global_best_bound:.4f}, Incumbent: {self.incumbent_objective} ---")
 
@@ -191,16 +224,23 @@ class TreeManager:
                         logger.info(f"Optimality gap ({gap:.6f}) reached {self.optimality_gap}. Terminating solver.")
                         break
 
-            node_selection_strategy = self.config['strategy']['node_selection']
-            if node_selection_strategy == 'best_bound':
-                current_node = min(self.active_nodes, key=lambda node: node.lp_objective) if not self.is_maximization else max(self.active_nodes, key=lambda node: node.lp_objective)
-                self.active_nodes.remove(current_node)
-            else: # 'depth_first' or 'hybrid' start
-                current_node = self.active_nodes.pop()
+            # --- 3. USE HEAPPOP TO GET THE NEXT NODE ---
+            current_node = heapq.heappop(self.active_nodes)
 
-            logger.info(f"Processing node {current_node.node_id}. LP Objective: {current_node.lp_objective:.4f}")
+            logger.info(f"Processing node {current_node.node_id} (Depth: {current_node.depth}). LP Objective: {current_node.lp_objective:.4f}")
             
-            # --- FIX: Restored the cut generation and application logic ---
+            heuristic_freq = self.config['solver_params'].get('heuristic_frequency', 20)
+            if self.incumbent_solution and self.node_counter % heuristic_freq == 1:
+                heuristic_result = run_periodic_heuristics(
+                    problem=self.problem,
+                    current_node_solution=current_node.lp_solution,
+                    incumbent_solution=self.incumbent_solution,
+                    config=self.config['solver_params']
+                )
+                if heuristic_result:
+                    if self._update_incumbent(heuristic_result['solution'], heuristic_result['objective']):
+                        continue # If new incumbent, re-evaluate next node
+
             if not self._is_integer_feasible(current_node.lp_solution):
                 cuts_to_add = self._find_violated_pool_cuts(current_node.lp_solution)
                 
@@ -231,22 +271,13 @@ class TreeManager:
                     else:
                          logger.warning(f"LP re-solve failed with status {lp_result_after_cuts['status']}. Pruning node.")
                          continue
-            # --- END FIX ---
 
-            if self.incumbent_objective is not None:
-                if (self.is_maximization and current_node.lp_objective <= self.incumbent_objective) or \
-                   (not self.is_maximization and current_node.lp_objective >= self.incumbent_objective):
-                    logger.info(f"Node {current_node.node_id} pruned by bound.")
-                    continue
+            if not self._is_promising(current_node):
+                logger.info(f"Node {current_node.node_id} pruned by bound.")
+                continue
 
             if current_node.lp_solution and self._is_integer_feasible(current_node.lp_solution):
-                is_new_best = self.incumbent_objective is None or \
-                              (self.is_maximization and current_node.lp_objective > self.incumbent_objective) or \
-                              (not self.is_maximization and current_node.lp_objective < self.incumbent_objective)
-                if is_new_best:
-                    self.incumbent_solution = current_node.lp_solution
-                    self.incumbent_objective = current_node.lp_objective
-                    logger.info(f"New incumbent found! Objective: {self.incumbent_objective:.4f}")
+                self._update_incumbent(current_node.lp_solution, current_node.lp_objective)
                 continue
 
             current_node.lp_solution['objective'] = current_node.lp_objective
@@ -266,15 +297,14 @@ class TreeManager:
                     degradation = abs(child_lp_result['objective'] - current_node.lp_objective)
                     self._update_pseudocosts(branch_var_name, direction, degradation)
                     
-                    if self.incumbent_objective is not None and \
-                       ((self.is_maximization and child_lp_result['objective'] <= self.incumbent_objective) or \
-                       (not self.is_maximization and child_lp_result['objective'] >= self.incumbent_objective)):
+                    if not self._is_promising(Node(node_id=-1, parent_id=-1, lp_objective=child_lp_result['objective'], depth=0)):
                         logger.info(f"Child node pruned by bound upon creation.")
                         continue
                     
-                    child_node = Node(node_id=self.node_counter, parent_id=current_node.node_id, local_constraints=child_constraints, lp_objective=child_lp_result['objective'], lp_solution=child_lp_result['solution'], status='SOLVED', vbasis=child_lp_result.get('vbasis'), cbasis=child_lp_result.get('cbasis'))
+                    child_node = Node(node_id=self.node_counter, parent_id=current_node.node_id, local_constraints=child_constraints, lp_objective=child_lp_result['objective'], lp_solution=child_lp_result['solution'], status='SOLVED', vbasis=child_lp_result.get('vbasis'), cbasis=child_lp_result.get('cbasis'), depth=current_node.depth + 1)
                     self.node_counter += 1
-                    self.active_nodes.append(child_node)
+                    # --- 2. USE HEAPPUSH TO ADD THE NODE ---
+                    heapq.heappush(self.active_nodes, child_node)
                     logger.info(f"Child node {child_node.node_id} created. LP Obj: {child_lp_result['objective']:.4f}")
                 else:
                     logger.info(f"Child node is {child_lp_result['status']}. Pruning.")

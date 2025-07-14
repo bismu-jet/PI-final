@@ -5,7 +5,7 @@ solver_params:
   # The relative gap at which the solver will terminate
   optimality_gap: 0.0001
   # The maximum time in seconds the solver is allowed to run
-  time_limit_seconds: 300
+  time_limit_seconds: 900
 
 # Parameters controlling the strategic decisions of the solver
 strategy:
@@ -17,3 +17,6 @@ strategy:
   # Options: 'most_fractional', 'strong_branching'
   branching_variable: 'pseudocost'
 
+  # --- Recommended New Parameters for Heuristics ---
+  heuristic_frequency: 20  # Runs periodic heuristics every 20 nodes.
+  rins_time_limit: 5.0     # Sets a 5-second time limit for the RINS sub-MIP.
