@@ -349,7 +349,7 @@ def propagate_bounds(problem: MIPProblem) -> int:
     return tightenings
 
 
-def probe_binary_variables(problem: MIPProblem) -> None:
+def probe_binary_variables(problem: MIPProblem, config: Dict[str, Any]) -> None:
     """
     Performs probing on binary variables. For each binary variable, it temporarily
     fixes it to 0 and then to 1. If either temporary fix leads to an infeasible
@@ -358,16 +358,39 @@ def probe_binary_variables(problem: MIPProblem) -> None:
     
     Args:
         problem (MIPProblem): The MIP problem instance.
+        config (Dict[str, Any]): A dictionary of configuration parameters,
+            which may contain a 'probing_variable_limit'.
     """
     logger.info("Starting presolve technique: Probing...")
     model: gp.Model = problem.model
     model.update()
 
+    # Get the probing limit from the configuration. Default to -1 (no limit).
+    probe_limit = config.get('probing_variable_limit', -1)
+
     # Get a list of binary variables that are not already fixed.
-    binary_vars: List[gp.Var] = [v for v in model.getVars() if v.VType == GRB.BINARY and v.LB != v.UB]
-    if not binary_vars:
+    unfixed_binary_vars: List[gp.Var] = [v for v in model.getVars() if v.VType == GRB.BINARY and v.LB != v.UB]
+
+    if not unfixed_binary_vars:
         logger.info("Probing: No unfixed binary variables to probe.")
         return
+
+    # Determine which variables to probe based on the limit.
+    binary_vars_to_probe: List[gp.Var]
+    if probe_limit > 0 and probe_limit < len(unfixed_binary_vars):
+        logger.info(f"Probing will be limited to the top {probe_limit} variables based on objective coefficient magnitude.")
+        
+        # --- Score variables to select the most impactful ones for probing ---
+        scored_vars = [(var, abs(var.Obj)) for var in unfixed_binary_vars]
+        
+        # Sort variables by score in descending order.
+        scored_vars.sort(key=lambda x: x[1], reverse=True)
+        
+        # Select the top 'probe_limit' variables.
+        binary_vars_to_probe = [var for var, score in scored_vars[:probe_limit]]
+    else:
+        # If no limit is set, or the limit is larger than the number of vars, probe all.
+        binary_vars_to_probe = unfixed_binary_vars
 
     # Store variables that can be fixed based on probing results.
     vars_to_fix_to_0: List[str] = []
@@ -382,10 +405,10 @@ def probe_binary_variables(problem: MIPProblem) -> None:
         probe_model.setParam('TimeLimit', 1) 
         probe_model.setParam('Method', 0) 
 
-        total_probes: int = len(binary_vars)
+        total_probes: int = len(binary_vars_to_probe)
         logger.info(f"Probing {total_probes} binary variables...")
 
-        for i, var in enumerate(binary_vars):
+        for i, var in enumerate(binary_vars_to_probe):
             # Get the corresponding variable in the copied model.
             p_var: gp.Var = probe_model.getVarByName(var.VarName)
             logger.debug(f"Probing [{i+1}/{total_probes}]: '{var.VarName}'")
@@ -436,7 +459,7 @@ def probe_binary_variables(problem: MIPProblem) -> None:
         logger.info("Probing did not find any variable fixings.")
 
 
-def presolve(problem: MIPProblem) -> None:
+def presolve(problem: MIPProblem, config: Dict[str, Any]) -> None:
     """
     The main presolve routine. It calls various presolve techniques iteratively
     to simplify the MIP problem as much as possible before starting the main
@@ -444,6 +467,7 @@ def presolve(problem: MIPProblem) -> None:
     
     Args:
         problem (MIPProblem): The MIP problem instance to be presolved.
+        config (Dict[str, Any]): Dictionary of presolve-related parameters.
     """
     logger.info("--- Starting Presolve Phase ---")
     
@@ -473,6 +497,6 @@ def presolve(problem: MIPProblem) -> None:
             break
             
     # Probing is often run last as it can be more computationally expensive.
-    probe_binary_variables(problem)
+    probe_binary_variables(problem, config)
     
     logger.info("--- Presolve Phase Finished ---")

@@ -7,3 +7,6 @@ solver_params:
 strategy:
   node_selection: 'hybrid'
   branching_variable: 'pseudocost'
+
+presolve_params:
+  probing_variable_limit: 100

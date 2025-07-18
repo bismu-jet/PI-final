@@ -49,7 +49,7 @@ class TreeManager:
         # --- Presolve Phase ---
         # Apply presolve techniques to simplify the model before starting the B&B.
         logger.info("--- Starting Presolve Phase ---")
-        presolve(self.problem)
+        presolve(self.problem, self.config.get('presolve_params', {}))
         logger.info("--- Presolve Phase Finished ---")
         
         # List of active (unexplored) nodes in the B&B tree. Uses a min-heap.
